@@ -24,8 +24,8 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     private const int PackageCount = 32;
     private const int CmdTimeoutMs = 5000;
     private const int PlotUpdateIntervalMs = 50;
-    private const int FftUpdateIntervalMs = 500;
-    private const string DemoVersion = "0.1.13";
+    private const int FftUpdateIntervalMs = 200;
+    private const string DemoVersion = "0.1.14";
     private const int PowerRefreshPeriodMs = 60000;
     private const int PowerStableBand = 4;
     private const uint ReplayDelegateTimeoutMs = 5000;
@@ -124,8 +124,22 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     private List<float[]> _fftMags = new List<float[]>();
     private long _fftLastSubmitMs;
 
+    // Per-channel spectra in the EMG/EEG bio rows: shares the FFT worker
+    // above; _bioFftChannels is the current row -> ring channel binding
+    // (-1 = no spectrum on that row), _bioFftEpoch invalidates results
+    // computed before the latest LayoutBio.
+    private bool _bioFftReady;
+    private int _bioFftResultEpoch = -1;
+    private string _bioFftMac = string.Empty;
+    private float[] _bioFftFreqs = new float[0];
+    private List<float[]> _bioFftMags = new List<float[]>();
+    private long _bioFftLastSubmitMs;
+    private int _bioFftEpoch;
+    private int[] _bioFftChannels = { -1, -1, -1, -1, -1, -1, -1, -1 };
+
     // Views (created in Start).
     private readonly List<WaveformView> _bioWaves = new List<WaveformView>();
+    private readonly List<SpectrumView> _bioSpectra = new List<SpectrumView>();
     private WaveformView _wave2d;
     private SpectrumView _spectrum;
 
@@ -192,7 +206,10 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         _binPath = DefaultBins.FirstOrDefault(File.Exists) ?? string.Empty;
 
         for (int i = 0; i < 8; i++)
+        {
             _bioWaves.Add(new WaveformView());
+            _bioSpectra.Add(new SpectrumView());
+        }
         _wave2d = new WaveformView();
         _spectrum = new SpectrumView();
 
@@ -381,10 +398,17 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         _spectrum.MarkDirty();
         foreach (WaveformView w in _bioWaves)
             w.MarkDirty();
+        for (int i = 0; i < _bioSpectra.Count; i++)
+        {
+            if (i < _bioFftChannels.Length && _bioFftChannels[i] >= 0)
+                _bioSpectra[i].MarkDirty();
+        }
 
         DeviceState st = CurrentState();
         PollFftResult();
         MaybeSubmitFft(st);
+        PollBioFftResult();
+        MaybeSubmitBioFft(st);
 
         bool bioReady = st != null && ((st.GetBioKind() == DeviceState.BioKind.EMG && st.Emg.Allocated)
                                        || (st.GetBioKind() == DeviceState.BioKind.EEG && st.Eeg.Allocated)
@@ -1465,6 +1489,97 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         }
     }
 
+    // Per-channel spectra of the EMG/EEG bio rows: the bound rows' ring
+    // channels are snapshotted oldest -> newest and computed on the shared
+    // FFT worker; results whose device or bio layout no longer match are
+    // dropped.
+    private void MaybeSubmitBioFft(DeviceState st)
+    {
+        if (st == null || _fftBusy)
+            return;
+        DeviceState.BioKind kind = st.GetBioKind();
+        if (kind != DeviceState.BioKind.EMG && kind != DeviceState.BioKind.EEG)
+            return;
+        var channels = new List<int>();
+        foreach (int c in _bioFftChannels)
+        {
+            if (c >= 0)
+                channels.Add(c);
+        }
+        if (channels.Count == 0)
+            return;
+        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        if (now - _bioFftLastSubmitMs < FftUpdateIntervalMs)
+            return;
+        RingBuffer buf = kind == DeviceState.BioKind.EMG ? st.Emg : st.Eeg;
+        List<float[]> snapshot;
+        float rate;
+        lock (st.BufMutex)
+        {
+            if (!buf.Allocated || buf.Length < 16 || buf.SampleRate <= 0)
+                return;
+            foreach (int c in channels)
+            {
+                if (c >= buf.Channels)
+                    return;
+            }
+            rate = buf.SampleRate;
+            // Reassemble the circular buffer oldest -> newest.
+            snapshot = new List<float[]>(channels.Count);
+            foreach (int c in channels)
+            {
+                var row = new float[buf.Length];
+                float[] src = buf.Samples[c];
+                for (int i = 0; i < buf.Length; i++)
+                    row[i] = src[(buf.WriteIndex + i) % buf.Length];
+                snapshot.Add(row);
+            }
+        }
+        _bioFftLastSubmitMs = now;
+        _fftBusy = true;
+        int epoch = _bioFftEpoch;
+        string mac = st.Mac;
+        Task.Run(() =>
+        {
+            float[] freqs;
+            List<float[]> mags;
+            SpectrumCompute.Compute(snapshot, rate, out freqs, out mags);
+            lock (_fftMutex)
+            {
+                _bioFftFreqs = freqs;
+                _bioFftMags = mags;
+                _bioFftResultEpoch = epoch;
+                _bioFftMac = mac;
+                _bioFftReady = true;
+            }
+            _fftBusy = false;
+        });
+    }
+
+    private void PollBioFftResult()
+    {
+        lock (_fftMutex)
+        {
+            if (!_bioFftReady)
+                return;
+            _bioFftReady = false;
+            // Drop stale results: the device or the bio layout may have
+            // changed while the worker was computing.
+            DeviceState st = CurrentState();
+            if (st == null || _bioFftMac != st.Mac || _bioFftResultEpoch != _bioFftEpoch)
+                return;
+            int row = 0;
+            for (int i = 0; i < _bioSpectra.Count; i++)
+            {
+                if (i >= _bioFftChannels.Length || _bioFftChannels[i] < 0)
+                    continue;
+                if (row < _bioFftMags.Count)
+                    _bioSpectra[i].SetResult(_bioFftFreqs, new List<float[]> { _bioFftMags[row] });
+                ++row;
+            }
+        }
+    }
+
     // ------------------------------------------------------------------
     // Waveform targeting / bio panel layout
     // ------------------------------------------------------------------
@@ -1533,6 +1648,10 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     private void LayoutBio(DeviceState st)
     {
         _bioTargets = new ImpedanceTarget[_bioWaves.Count];
+        ++_bioFftEpoch;
+        _bioFftChannels = new int[_bioWaves.Count];
+        for (int i = 0; i < _bioFftChannels.Length; i++)
+            _bioFftChannels[i] = -1;
         DeviceState.BioKind kind = st != null ? st.GetBioKind() : DeviceState.BioKind.None;
         string waiting = st != null ? "Waiting for data ..." : "Not connected";
 
@@ -1548,6 +1667,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
                     _bioWaves[i].SetSource(st.Emg, st.BufMutex, i);
                     _bioWaves[i].SetLabels(new[] { $"EMG-{i + 1}" });
                     _bioWaves[i].SetPlaceholder(string.Empty);
+                    SetBioSpectrum(i, i, $"EMG-{i + 1}");
                     _bioTargets[i] = new ImpedanceTarget(st.EmgImpedance, i);
                 }
                 else
@@ -1578,6 +1698,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
                     _bioWaves[i].SetSource(st.Eeg, st.BufMutex, eegCh);
                     _bioWaves[i].SetLabels(new[] { $"EEG-{eegCh + 1}" });
                     _bioWaves[i].SetPlaceholder(string.Empty);
+                    SetBioSpectrum(i, eegCh, $"EEG-{eegCh + 1}");
                     _bioTargets[i] = new ImpedanceTarget(st.EegImpedance, eegCh);
                 }
                 else if (hasECG && i == ecgIndex && st.Ecg.Allocated)
@@ -1585,6 +1706,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
                     _bioWaves[i].SetSource(st.Ecg, st.BufMutex, 0);
                     _bioWaves[i].SetLabels(new[] { "ECG" });
                     _bioWaves[i].SetPlaceholder(string.Empty);
+                    SetBioSpectrum(i, -1, string.Empty);
                     _bioTargets[i] = new ImpedanceTarget(st.EcgImpedance, 0);
                 }
                 else if (hasBRTH && i == brthIndex && st.Brth.Allocated)
@@ -1592,6 +1714,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
                     _bioWaves[i].SetSource(st.Brth, st.BufMutex, 0);
                     _bioWaves[i].SetLabels(new[] { "BRTH" });
                     _bioWaves[i].SetPlaceholder(string.Empty);
+                    SetBioSpectrum(i, -1, string.Empty);
                     _bioTargets[i] = new ImpedanceTarget(st.BrthImpedance, 0);
                 }
                 else
@@ -1625,6 +1748,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
                         _bioWaves[i].SetSource(cfg.Buffer, st.BufMutex, cfg.Channel, i);
                         _bioWaves[i].SetLabels(new[] { cfg.Label });
                         _bioWaves[i].SetPlaceholder(string.Empty);
+                        SetBioSpectrum(i, -1, string.Empty);
                         _bioTargets[i] = cfg.IsEeg
                             ? new ImpedanceTarget(st.EegImpedance, cfg.Channel)
                             : new ImpedanceTarget(null, 0);
@@ -1658,12 +1782,30 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         }
     }
 
+    // Row spectrum binding: channel >= 0 shows the row's spectrum, -1 hides
+    // it (the waveform then spans the full row width).
+    private void SetBioSpectrum(int row, int channel, string label)
+    {
+        if (channel >= 0)
+        {
+            _bioFftChannels[row] = channel;
+            _bioSpectra[row].SetColorIndex(channel);
+            _bioSpectra[row].SetLabels(new[] { label });
+            _bioSpectra[row].SetPlaceholder(string.Empty);
+        }
+        else
+        {
+            _bioSpectra[row].ClearResult();
+        }
+    }
+
     private void ClearBioSlot(int i, string placeholder)
     {
         _bioWaves[i].SetSource(null, null, i);
         _bioWaves[i].SetLabels(new string[0]);
         _bioWaves[i].SetPlaceholder(placeholder);
         _bioWaves[i].SetSideText(string.Empty, Color.white);
+        SetBioSpectrum(i, -1, string.Empty);
         _bioTargets[i] = new ImpedanceTarget(null, 0);
     }
 

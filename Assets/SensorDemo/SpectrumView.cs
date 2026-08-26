@@ -11,6 +11,7 @@ namespace SensorSdk.ExampleUnity
         private List<float[]> _mags = new List<float[]>();
         private string[] _labels = new string[0];
         private string _placeholder = "Not connected";
+        private int _colorIndex = -1;
 
         private Texture2D _tex;
         private Color32[] _pixels;
@@ -40,6 +41,14 @@ namespace SensorSdk.ExampleUnity
         public void SetPlaceholder(string text)
         {
             _placeholder = text;
+            _dirty = true;
+        }
+
+        // colorIndex >= 0 pins the curve color (single-channel rows); -1
+        // colors each curve by its row index.
+        public void SetColorIndex(int colorIndex)
+        {
+            _colorIndex = colorIndex;
             _dirty = true;
         }
 
@@ -75,7 +84,8 @@ namespace SensorSdk.ExampleUnity
             {
                 for (int ch = 0; ch < _mags.Count; ch++)
                 {
-                    GUI.color = WaveformView.ChannelColors[ch % WaveformView.ChannelColors.Length];
+                    int colorIdx = _colorIndex >= 0 ? _colorIndex : ch;
+                    GUI.color = WaveformView.ChannelColors[colorIdx % WaveformView.ChannelColors.Length];
                     string label = ch < _labels.Length ? _labels[ch] : $"ch{ch}";
                     GUI.Label(new Rect(rect.x + 6, rect.y + 1 + ch * 13, 120, 14), label, SmallStyle());
                 }
@@ -131,7 +141,8 @@ namespace SensorSdk.ExampleUnity
                     for (int ch = 0; ch < _mags.Count; ch++)
                     {
                         float[] row = _mags[ch];
-                        Color32 color = WaveformView.ChannelColors[ch % WaveformView.ChannelColors.Length];
+                        int colorIdx = _colorIndex >= 0 ? _colorIndex : ch;
+                        Color32 color = WaveformView.ChannelColors[colorIdx % WaveformView.ChannelColors.Length];
                         int prevX = -1, prevY = -1;
                         for (int i = 0; i < row.Length && i < _freqs.Length; i++)
                         {

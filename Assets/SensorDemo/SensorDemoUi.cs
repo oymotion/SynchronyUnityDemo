@@ -273,8 +273,22 @@ public sealed partial class SensorDemoBehaviour
         GUILayout.Label(_bioTitle, Rich());
 
         _bioScroll = GUILayout.BeginScrollView(_bioScroll);
-        foreach (SensorSdk.ExampleUnity.WaveformView w in _bioWaves)
-            w.Draw(GUILayoutUtility.GetRect(area.width - 30, 90, GUILayout.ExpandWidth(true)));
+        // Rows with a bound spectrum (EMG/EEG channels) split 50/50:
+        // spectrum left, waveform right; other rows stay full-width.
+        for (int i = 0; i < _bioWaves.Count; i++)
+        {
+            Rect row = GUILayoutUtility.GetRect(area.width - 30, 90, GUILayout.ExpandWidth(true));
+            if (i < _bioFftChannels.Length && _bioFftChannels[i] >= 0)
+            {
+                float half = (row.width - 4) / 2;
+                _bioSpectra[i].Draw(new Rect(row.x, row.y, half, row.height));
+                _bioWaves[i].Draw(new Rect(row.x + half + 4, row.y, half, row.height));
+            }
+            else
+            {
+                _bioWaves[i].Draw(row);
+            }
+        }
         GUILayout.EndScrollView();
     }
 
@@ -311,8 +325,11 @@ public sealed partial class SensorDemoBehaviour
             RetargetWaveforms();
         }
 
-        _wave2d.Draw(GUILayoutUtility.GetRect(area.width - 30, 140, GUILayout.ExpandWidth(true)));
-        _spectrum.Draw(GUILayoutUtility.GetRect(area.width - 30, 70, GUILayout.ExpandWidth(true)));
+        // Waveform/spectrum pair: spectrum left, waveform right, 50/50.
+        Rect waveRow = GUILayoutUtility.GetRect(area.width - 30, 140, GUILayout.ExpandWidth(true));
+        float waveHalf = (waveRow.width - 4) / 2;
+        _spectrum.Draw(new Rect(waveRow.x, waveRow.y, waveHalf, waveRow.height));
+        _wave2d.Draw(new Rect(waveRow.x + waveHalf + 4, waveRow.y, waveHalf, waveRow.height));
 
         GUILayout.BeginVertical("box");
         GUILayout.Label("<b>Real-time Values</b>", Rich());
