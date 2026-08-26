@@ -16,7 +16,7 @@ demo's own version (bump +0.0.1 per demo change).
 
 Unity 2021.3+ (.NET Standard 2.1 API compatibility level — the default).
 Targets Windows (x86_64 / x86), Android (arm64-v8a / x86 / x86_64), iOS,
-macOS and Linux (x86_64 / x86) players; Mono editor and IL2CPP standalone
+macOS and Linux (x86_64 / x86 / arm64) players; Mono editor and IL2CPP standalone
 builds both work.
 
 ## Setup
@@ -36,9 +36,10 @@ This repository **is** the Unity project, with everything pre-installed:
   `AndroidManifest.xml` — the AAR bundles the Java BLE bridge and
   libsensor.so for arm64-v8a / x86 / x86_64
 - `Assets/Plugins/iOS/sensor.xcframework` — iOS device + simulator slices
-- `Assets/Plugins/Linux/x86_64/libsensor.so` and
-  `Assets/Plugins/Linux/x86/libsensor.so` — the Linux runtimes (64-bit /
-  32-bit)
+- `Assets/Plugins/Linux/x86_64/libsensor.so`,
+  `Assets/Plugins/Linux/x86/libsensor.so` and
+  `Assets/Plugins/Linux/arm64/libsensor.so` — the Linux runtimes (64-bit /
+  32-bit / ARM64)
 
 Just open the project with Unity **2021.3+** (.NET Standard 2.1 API
 compatibility level — the default) and press **Play**. SDK file logs land
