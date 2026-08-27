@@ -92,7 +92,7 @@ namespace SensorSdk.ExampleUnity
             {
                 StructSize = Marshal.SizeOf(typeof(OpenFileName)),
                 Filter = "Bin Files (*.bin)\0*.bin\0All Files (*.*)\0*.*\0",
-                File = new StringBuilder(new char[FileBufferChars]),
+                File = new StringBuilder(new string(new char[FileBufferChars])),
                 MaxFile = FileBufferChars,
                 Flags = OfnExplorer | OfnFileMustExist | (multi ? OfnAllowMultiSelect : 0),
                 Title = multi ? "Select bin files" : "Select bin file",

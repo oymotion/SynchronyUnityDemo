@@ -1883,7 +1883,9 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         _cube = GameObject.CreatePrimitive(PrimitiveType.Cube);
         _cube.name = "SensorDemoCube";
         _cube.layer = 8;
-        _cube.transform.localScale = Vector3.one * 2;
+        _cube.transform.localScale = Vector3.one * 1.5f;
+        _cube.transform.localPosition = new Vector3(0f, -0.5f, 0f);
+        
 
         // Six faces, one submesh + one flat color each
         var mf = _cube.GetComponent<MeshFilter>();
