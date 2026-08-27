@@ -1,3 +1,5 @@
+#undef RUN_IN_START
+
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -9,16 +11,25 @@ using UnityEngine;
 using SensorSdk;
 using SensorSdk.Capi;
 using SensorSdk.ExampleUnity;
+using System.Collections;
+
+
+#if UNITY_ANDROID && !UNITY_EDITOR
+using UnityEngine.Android;
+#endif
+
 
 /// <summary>Multi-device sensor demo behaviour.</summary>
 public sealed partial class SensorDemoBehaviour : MonoBehaviour
 {
+#if RUN_IN_START
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     private static void Bootstrap()
     {
         if (FindObjectOfType<SensorDemoBehaviour>() == null)
             new GameObject("SensorDemo").AddComponent<SensorDemoBehaviour>();
     }
+#endif
 
     private const int ScanDevicePeriodMs = 3000;
     private const int PackageCount = 32;
@@ -201,8 +212,13 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
 
     private float _nextPlotTick;
 
+    private bool _permissionsGranted;
+
     private void Start()
     {
+        // get permissions on Android
+        StartCoroutine(RequestPermissionsCoroutine());
+
         _binPath = DefaultBins.FirstOrDefault(File.Exists) ?? string.Empty;
 
         for (int i = 0; i < 8; i++)
@@ -246,6 +262,55 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
             _dataWorker = null;
         }
     }
+
+    private IEnumerator RequestPermissionsCoroutine()
+    {
+#if UNITY_ANDROID && !UNITY_EDITOR
+    string[] permissions = {
+        Permission.FineLocation,
+        Permission.CoarseLocation,
+        "android.permission.BLUETOOTH_SCAN",
+        "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.BLUETOOTH",
+        "android.permission.BLUETOOTH_ADMIN"
+    };
+
+    var needRequest = new List<string>();
+    foreach (var perm in permissions)
+    {
+        if (!Permission.HasUserAuthorizedPermission(perm))
+            needRequest.Add(perm);
+    }
+
+    if (needRequest.Count > 0)
+    {
+        Permission.RequestUserPermissions(needRequest.ToArray());
+
+        float timeout = 10f;
+        while (timeout > 0)
+        {
+            bool allGranted = true;
+            foreach (var perm in needRequest)
+            {
+                if (!Permission.HasUserAuthorizedPermission(perm))
+                {
+                    allGranted = false;
+                    break;
+                }
+            }
+            if (allGranted) break;
+            yield return new WaitForSeconds(0.2f);
+            timeout -= 0.2f;
+        }
+    }
+
+    _permissionsGranted = true;
+#else
+        _permissionsGranted = true;
+#endif
+        yield return null;
+    }
+
 
     // Android BLE bridge
     private void PlatformInit()
@@ -1818,7 +1883,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         _cube = GameObject.CreatePrimitive(PrimitiveType.Cube);
         _cube.name = "SensorDemoCube";
         _cube.layer = 8;
-        _cube.transform.localScale = new Vector3(1.4f, 1.0f, 0.6f);
+        _cube.transform.localScale = Vector3.one * 2;
 
         // Six faces, one submesh + one flat color each
         var mf = _cube.GetComponent<MeshFilter>();
@@ -1826,7 +1891,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         if (mf != null && mr != null)
         {
             mf.mesh = BuildColoredCubeMesh();
-            mr.materials = BuildFaceMaterials();
+            mr.material = CreateFlatMaterial(Color.white);
         }
 
         // Body axes (X red / Y green / Z blue)
@@ -1842,10 +1907,6 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         _cubeCamera.orthographic = true;
         _cubeCamera.orthographicSize = 1.7f;
         camGo.transform.position = new Vector3(0f, 0f, -4f);
-        var lightGo = new GameObject("SensorDemoCubeLight");
-        var light = lightGo.AddComponent<Light>();
-        light.type = LightType.Directional;
-        lightGo.transform.rotation = Quaternion.Euler(40f, -30f, 0f);
         _cubeCamera.enabled = false;    // only on the IMU page
     }
 
@@ -1858,26 +1919,20 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         new Color32(60, 160, 60, 255),     // -X
         new Color32(60, 100, 220, 255),    // +X
     };
-
-    // Flat always-opaque materials (no lighting, no transparency).
-    private static Material[] BuildFaceMaterials()
+    
+    private static Material CreateFlatMaterial(Color32 tint)
     {
-        Shader shader = Shader.Find("Universal Render Pipeline/Unlit");
+        Shader shader = Shader.Find("SensorDemo/CubeFace");
         if (shader == null)
             shader = Shader.Find("Unlit/Color");
         if (shader == null)
             shader = Shader.Find("Standard");
-        var mats = new Material[CubeFaceColors.Length];
-        for (int i = 0; i < mats.Length; ++i)
-        {
-            mats[i] = new Material(shader);
-            Color c = CubeFaceColors[i];
-            if (mats[i].HasProperty("_BaseColor"))
-                mats[i].SetColor("_BaseColor", c);
-            else
-                mats[i].color = c;
-        }
-        return mats;
+        var mat = new Material(shader);
+        if (mat.HasProperty("_BaseColor"))
+            mat.SetColor("_BaseColor", tint);
+        else
+            mat.color = tint;
+        return mat;
     }
 
     private static Mesh BuildColoredCubeMesh()
@@ -1899,20 +1954,28 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
 
         var verts = new List<Vector3>();
         var norms = new List<Vector3>();
+        var cols = new List<Color32>();
+        var tris = new List<int>();
         for (int f = 0; f < 6; ++f)
         {
+            int start = verts.Count;
             for (int k = 0; k < 4; ++k)
             {
                 verts.Add(faceCorners[f][k]);
                 norms.Add(faceNormals[f]);
+                cols.Add(CubeFaceColors[f]);
             }
+            // Unity front faces are clockwise seen from outside; the corner
+            // lists run counter-clockwise, so the triangle winding is flipped.
+            tris.Add(start + 0); tris.Add(start + 2); tris.Add(start + 1);
+            tris.Add(start + 0); tris.Add(start + 3); tris.Add(start + 2);
         }
         var mesh = new Mesh { name = "SensorDemoColoredCube" };
         mesh.SetVertices(verts);
         mesh.SetNormals(norms);
-        mesh.subMeshCount = 6;
-        for (int f = 0; f < 6; ++f)
-            mesh.SetTriangles(new[] { f * 4, f * 4 + 1, f * 4 + 2, f * 4, f * 4 + 2, f * 4 + 3 }, f);
+        mesh.SetColors(cols);
+        mesh.SetTriangles(tris, 0);
+        mesh.RecalculateBounds();
         return mesh;
     }
 
@@ -1933,8 +1996,8 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         float halfLen = (dir.x != 0 ? size.x : dir.y != 0 ? size.y : size.z) * 0.5f;
         axis.transform.localPosition = dir * (0.5f + halfLen);
         var mr = axis.GetComponent<MeshRenderer>();
-        if (mr != null && mr.material != null)
-            mr.material.color = color;
+        if (mr != null)
+            mr.material = CreateFlatMaterial(color);
     }
 
     private void UpdateCubeCamera()
