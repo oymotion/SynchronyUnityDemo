@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using UnityEngine;
 
 namespace SensorSdk.ExampleUnity
@@ -39,6 +38,10 @@ namespace SensorSdk.ExampleUnity
         private Color32[] _pixels;
         private bool _dirty = true;
         private long _lastRepaintMs;
+
+        // Reusable paint snapshot buffers (oldest -> newest per channel).
+        private int[] _snapChannels = new int[0];
+        private float[][] _snapSamples = new float[0][];
 
         /// <summary>channel == -1 draws all channels; colorIndex picks the curve color.</summary>
         public void SetSource(RingBuffer buffer, object mutex, int channel, int colorIndex = -1)
@@ -161,35 +164,53 @@ namespace SensorSdk.ExampleUnity
 
             RingBuffer buf = _buffer;
             object mutex = _mutex;
+            int snapLen = 0;
+            int snapCount = 0;
             if (buf != null && mutex != null)
             {
                 lock (mutex)
                 {
                     if (buf.Allocated && buf.Length >= 2)
-                        DrawChannels(buf, px, py, pw, ph);
+                        snapCount = SnapshotChannels(buf, out snapLen);
                 }
             }
+            if (snapCount > 0)
+                DrawSnapshot(px, py, pw, ph, snapCount, snapLen);
             Flush();
         }
 
-        private void DrawChannels(RingBuffer buf, int px, int py, int pw, int ph)
+        // Copies the drawn channels (oldest -> newest) into the reusable
+        // snapshot buffers; returns the channel count.
+        private int SnapshotChannels(RingBuffer buf, out int snapLen)
         {
-            var channels = new List<int>();
-            if (_channel >= 0)
+            snapLen = buf.Length;
+            int count = _channel >= 0
+                ? (_channel < buf.Channels ? 1 : 0)
+                : buf.Channels;
+            if (count == 0)
+                return 0;
+            if (_snapChannels.Length < count)
             {
-                if (_channel < buf.Channels)
-                    channels.Add(_channel);
+                _snapChannels = new int[count];
+                _snapSamples = new float[count][];
             }
-            else
+            for (int k = 0; k < count; k++)
             {
-                for (int ch = 0; ch < buf.Channels; ch++)
-                    channels.Add(ch);
+                int ch = _channel >= 0 ? _channel : k;
+                _snapChannels[k] = ch;
+                if (_snapSamples[k] == null || _snapSamples[k].Length < snapLen)
+                    _snapSamples[k] = new float[snapLen];
+                float[] src = buf.Samples[ch];
+                float[] dst = _snapSamples[k];
+                int wi = buf.WriteIndex;
+                for (int i = 0; i < snapLen; i++)
+                    dst[i] = src[(wi + i) % snapLen];
             }
-            if (channels.Count == 0)
-                return;
+            return count;
+        }
 
-            int len = buf.Length;
-
+        private void DrawSnapshot(int px, int py, int pw, int ph, int snapCount, int snapLen)
+        {
             // Y range
             double low = _fixedLow;
             double high = _fixedHigh;
@@ -197,13 +218,13 @@ namespace SensorSdk.ExampleUnity
             {
                 double mn = double.MaxValue;
                 double mx = double.MinValue;
-                foreach (int ch in channels)
+                int step = Math.Max(1, snapLen / (pw * 2));
+                for (int k = 0; k < snapCount; k++)
                 {
-                    float[] samples = buf.Samples[ch];
-                    int step = Math.Max(1, len / (pw * 2));
-                    for (int i = 0; i < len; i += step)
+                    float[] samples = _snapSamples[k];
+                    for (int i = 0; i < snapLen; i += step)
                     {
-                        double v = samples[(buf.WriteIndex + i) % len];
+                        double v = samples[i];
                         mn = Math.Min(mn, v);
                         mx = Math.Max(mx, v);
                     }
@@ -227,16 +248,17 @@ namespace SensorSdk.ExampleUnity
             if (span <= 0)
                 return;
 
-            foreach (int ch in channels)
+            for (int k = 0; k < snapCount; k++)
             {
+                int ch = _snapChannels[k];
                 int colorIdx = _colorIndex >= 0 ? _colorIndex : ch;
                 Color32 color = ChannelColors[colorIdx % ChannelColors.Length];
-                float[] samples = buf.Samples[ch];
+                float[] samples = _snapSamples[k];
                 int prevY = -1;
                 for (int x = 0; x < pw; x++)
                 {
-                    int si = (int)((long)x * len / pw);
-                    double v = samples[(buf.WriteIndex + si) % len];
+                    int si = (int)((long)x * snapLen / pw);
+                    double v = samples[si];
                     int ty = py + ph - 1 - (int)((v - low) / span * (ph - 2));
                     if (prevY >= 0)
                         VLine(px + x, prevY, ty, color);

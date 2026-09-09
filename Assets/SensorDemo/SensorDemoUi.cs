@@ -33,11 +33,13 @@ public sealed partial class SensorDemoBehaviour
             }
         }
         GUILayout.BeginHorizontal();
-        GUILayout.Label($"<b>SensorSDKCXX Unity Demo (Multi)</b>   SDK: {_sdkVersion}   demo v{DemoVersion}",
+        GUILayout.Label($"<b>SensorSDKCXX Unity Demo (Multi)</b>   SDK: {_sdkVersion} | Backend: {_backendName}   demo v{DemoVersion}",
                         Rich());
         string multiLabel = anyStreaming ? "Multi Stop" : "Multi Start";
         if (UiButton(multiLabel, !multiReplaying && anyConnected, 90)) UiMultiSync();
         if (UiButton("Multi Replay Bin", !multiReplaying, 110)) UiMultiReplay();
+        if (UiButton(_dongleChecking ? "Checking Dongle..." : "Check Dongle",
+                     !_dongleChecking, 110, BoldButton())) UiCheckDongle();
         GUILayout.EndHorizontal();
 
         int newPage = GUILayout.Toolbar(_page, PageNames);
@@ -165,7 +167,7 @@ public sealed partial class SensorDemoBehaviour
         GUILayout.EndVertical();
         GUILayout.EndHorizontal();
 
-        // Settings row: Debug Log / Data Notification / Filter / EEG rate.
+        // Settings row: Debug Log / Data Notification / Filter / Sample rates.
         GUILayout.BeginHorizontal();
 
         GUILayout.BeginVertical("box");
@@ -202,24 +204,24 @@ public sealed partial class SensorDemoBehaviour
         GUILayout.EndHorizontal();
         GUILayout.EndVertical();
 
-        DeviceState cur = CurrentState();
-        if (cur == null || !cur.HasInfo || cur.Info.EEGChannelCount > 0)
+        // Sample-rate groups, each hidden entirely while its option list
+        // is empty; unsupported candidates stay hidden once it is known.
+        for (int kind = 0; kind < SampleRateGroupCount; kind++)
         {
+            List<int> options = _rateOptionsUi[kind];
+            if (options.Count == 0)
+                continue;
             GUILayout.BeginVertical("box");
-            GUILayout.Label("<b>EEG Sample Rate</b>", Rich());
+            GUILayout.Label("<b>" + SampleRateTitles[kind] + "</b>", Rich());
             GUILayout.BeginHorizontal();
-            foreach (int rate in SampleRateCandidates)
+            foreach (int rate in SampleRateCandidates[kind])
             {
-                bool enabled = _rateOptionsUi.Contains(rate);
-                if (!enabled && _rateOptionsUi.Count > 0)
+                if (!options.Contains(rate))
                     continue;
-                bool check = _rateCurrentUi == rate;
-                bool prev = GUI.enabled;
-                GUI.enabled = enabled;
+                bool check = _rateCurrentUi[kind] == rate;
                 bool nv = GUILayout.Toggle(check, rate + " Hz", "toggle");
-                GUI.enabled = prev;
-                if (nv && !check && enabled && !_updatingControls)
-                    OnSampleRateChecked(rate);
+                if (nv && !check && !_updatingControls)
+                    OnSampleRateChecked(kind, rate);
             }
             GUILayout.EndHorizontal();
             GUILayout.EndVertical();
@@ -273,12 +275,12 @@ public sealed partial class SensorDemoBehaviour
         GUILayout.Label(_bioTitle, Rich());
 
         _bioScroll = GUILayout.BeginScrollView(_bioScroll);
-        // Rows with a bound spectrum (EMG/EEG channels) split 50/50:
-        // spectrum left, waveform right; other rows stay full-width.
+        // Rows with a bound spectrum split 50/50: spectrum left, waveform
+        // right; other rows stay full-width.
         for (int i = 0; i < _bioWaves.Count; i++)
         {
             Rect row = GUILayoutUtility.GetRect(area.width - 30, 90, GUILayout.ExpandWidth(true));
-            if (i < _bioFftChannels.Length && _bioFftChannels[i] >= 0)
+            if (i < _bioFftRows.Length && _bioFftRows[i].Buffer != null)
             {
                 float half = (row.width - 4) / 2;
                 _bioSpectra[i].Draw(new Rect(row.x, row.y, half, row.height));
@@ -325,11 +327,11 @@ public sealed partial class SensorDemoBehaviour
             RetargetWaveforms();
         }
 
-        // Waveform/spectrum pair: spectrum left, waveform right, 50/50.
-        Rect waveRow = GUILayoutUtility.GetRect(area.width - 30, 140, GUILayout.ExpandWidth(true));
-        float waveHalf = (waveRow.width - 4) / 2;
-        _spectrum.Draw(new Rect(waveRow.x, waveRow.y, waveHalf, waveRow.height));
-        _wave2d.Draw(new Rect(waveRow.x + waveHalf + 4, waveRow.y, waveHalf, waveRow.height));
+        // Waveform full-width, spectrum strip below.
+        Rect waveRect = GUILayoutUtility.GetRect(area.width - 30, 150, GUILayout.ExpandWidth(true));
+        _wave2d.Draw(waveRect);
+        Rect specRect = GUILayoutUtility.GetRect(area.width - 30, 100, GUILayout.ExpandWidth(true));
+        _spectrum.Draw(specRect);
 
         GUILayout.BeginVertical("box");
         GUILayout.Label("<b>Real-time Values</b>", Rich());
@@ -344,13 +346,14 @@ public sealed partial class SensorDemoBehaviour
     // Control helpers
     // ------------------------------------------------------------------
 
-    private static bool UiButton(string label, bool enabled, float width = 0)
+    private static bool UiButton(string label, bool enabled, float width = 0, GUIStyle style = null)
     {
         bool prev = GUI.enabled;
         GUI.enabled = enabled;
+        GUIStyle s = style ?? GUI.skin.button;
         bool clicked = width > 0
-            ? GUILayout.Button(label, GUILayout.Width(width))
-            : GUILayout.Button(label);
+            ? GUILayout.Button(label, s, GUILayout.Width(width))
+            : GUILayout.Button(label, s);
         GUI.enabled = prev;
         return clicked;
     }
@@ -375,6 +378,14 @@ public sealed partial class SensorDemoBehaviour
         if (_rich == null)
             _rich = new GUIStyle(GUI.skin.label) { richText = true, wordWrap = true };
         return _rich;
+    }
+
+    private static GUIStyle _boldButton;
+    private static GUIStyle BoldButton()
+    {
+        if (_boldButton == null)
+            _boldButton = new GUIStyle(GUI.skin.button) { fontStyle = FontStyle.Bold };
+        return _boldButton;
     }
 
     private static GUIStyle _wrap;

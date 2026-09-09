@@ -149,9 +149,49 @@ namespace SensorSdk.ExampleUnity
         // Cached switch states: key -> (enabled, checked)
         public Dictionary<string, Bool2> NtfStates = new Dictionary<string, Bool2>();
         public Dictionary<string, Bool2> FilterStates = new Dictionary<string, Bool2>();
-        // Cached sample-rate control state
+        // Cached sample-rate control state (group kind: 0 = EEG, 1 = EMG,
+        // 2 = IMU, 3 = PPG)
         public List<int> SampleRateOptions = new List<int>();
         public int SampleRateCurrent;
+        public List<int> EmgSampleRateOptions = new List<int>();
+        public int EmgSampleRateCurrent;
+        public List<int> ImuSampleRateOptions = new List<int>();
+        public int ImuSampleRateCurrent;
+        public List<int> PpgSampleRateOptions = new List<int>();
+        public int PpgSampleRateCurrent;
+
+        public List<int> RateOptions(int kind)
+        {
+            switch (kind)
+            {
+                case 1: return EmgSampleRateOptions;
+                case 2: return ImuSampleRateOptions;
+                case 3: return PpgSampleRateOptions;
+                default: return SampleRateOptions;
+            }
+        }
+
+        public int RateCurrent(int kind)
+        {
+            switch (kind)
+            {
+                case 1: return EmgSampleRateCurrent;
+                case 2: return ImuSampleRateCurrent;
+                case 3: return PpgSampleRateCurrent;
+                default: return SampleRateCurrent;
+            }
+        }
+
+        public void SetRateCurrent(int kind, int rate)
+        {
+            switch (kind)
+            {
+                case 1: EmgSampleRateCurrent = rate; break;
+                case 2: ImuSampleRateCurrent = rate; break;
+                case 3: PpgSampleRateCurrent = rate; break;
+                default: SampleRateCurrent = rate; break;
+            }
+        }
 
         public BioKind GetBioKind()
         {

@@ -1,6 +1,7 @@
 #undef RUN_IN_START
 
 using System;
+using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -11,17 +12,16 @@ using UnityEngine;
 using SensorSdk;
 using SensorSdk.Capi;
 using SensorSdk.ExampleUnity;
-using System.Collections;
-
 
 #if UNITY_ANDROID && !UNITY_EDITOR
 using UnityEngine.Android;
 #endif
 
-
 /// <summary>Multi-device sensor demo behaviour.</summary>
 public sealed partial class SensorDemoBehaviour : MonoBehaviour
 {
+    // The behaviour normally lives in the Sample_Android scene; define
+    // RUN_IN_START to fall back to self-spawning with zero scene setup.
 #if RUN_IN_START
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     private static void Bootstrap()
@@ -31,19 +31,31 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     }
 #endif
 
-    private const int ScanDevicePeriodMs = 3000;
+    private const int ScanDevicePeriodMs = 6000;
     private const int PackageCount = 32;
     private const int CmdTimeoutMs = 5000;
     private const int PlotUpdateIntervalMs = 50;
     private const int FftUpdateIntervalMs = 200;
-    private const string DemoVersion = "0.1.14";
+    private const string DemoVersion = "0.1.19";
     private const int PowerRefreshPeriodMs = 60000;
     private const int PowerStableBand = 4;
     private const uint ReplayDelegateTimeoutMs = 5000;
 
     private static readonly string[] NtfKeys = { "NTF_EEG", "NTF_EMG", "NTF_GEST", "NTF_PPG", "NTF_SPO2", "NTF_IMU" };
     private static readonly string[] FilterKeys = { "FILTER_50HZ", "FILTER_60HZ", "FILTER_HPF", "FILTER_LPF" };
-    private static readonly int[] SampleRateCandidates = { 250, 500, 1000, 2000 };
+    // Sample-rate groups: 0 = EEG, 1 = EMG, 2 = IMU, 3 = PPG
+    private const int SampleRateGroupCount = 4;
+    private static readonly string[] SampleRateKeys =
+        { "EEG_SAMPLE_RATE", "EMG_SAMPLE_RATE", "IMU_SAMPLE_RATE", "PPG_SAMPLE_RATE" };
+    private static readonly string[] SampleRateTitles =
+        { "EEG Sample Rate", "EMG Sample Rate", "IMU Sample Rate", "PPG Sample Rate" };
+    private static readonly int[][] SampleRateCandidates =
+    {
+        new[] { 250, 500, 1000, 2000 },
+        new[] { 500, 1000 },
+        new[] { 50, 100, 200, 250, 400, 500, 1000, 2000 },
+        new[] { 50, 100, 200, 400, 800, 1000, 1600, 3200 },
+    };
     private static readonly Dictionary<string, string> NtfLabels = new Dictionary<string, string>
     {
         ["NTF_EEG"] = "EEG", ["NTF_EMG"] = "EMG", ["NTF_GEST"] = "GESTURE",
@@ -62,6 +74,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
 
     private SensorController _ctrl;
     private string _sdkVersion = "";
+    private string _backendName = "";
 
     private readonly ConcurrentQueue<Action> _uiQueue = new ConcurrentQueue<Action>();
 
@@ -70,6 +83,8 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         public string Name = string.Empty;
         public string Mac = string.Empty;
         public int Rssi;
+        // Consecutive scan rounds the device was absent from.
+        public int MissedRounds;
     }
 
     private sealed class DeviceRow
@@ -97,6 +112,8 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     private readonly List<string> _replayMacs = new List<string>();
     private bool _replayStopRequested;
     private bool _replayPaused;
+    private bool _replayStarting;
+    private Thread _replayStartThread;
     private string _binPath = string.Empty;
 
     // Per-device log/bin export paths reused across reconnects.
@@ -105,6 +122,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     private bool _debugLogEnabled = true;
     private bool _binDataEnabled = true;
     private bool _autoReconnect = true;
+    private bool _dongleChecking;
 
     private bool _updatingControls;
     private bool _shuttingDown;
@@ -135,18 +153,30 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     private List<float[]> _fftMags = new List<float[]>();
     private long _fftLastSubmitMs;
 
-    // Per-channel spectra in the EMG/EEG bio rows: shares the FFT worker
-    // above; _bioFftChannels is the current row -> ring channel binding
-    // (-1 = no spectrum on that row), _bioFftEpoch invalidates results
-    // computed before the latest LayoutBio.
+    // Per-row spectra in the bio rows: shares the FFT worker above;
+    // _bioFftRows is the current row -> ring binding (Buffer == null = no
+    // spectrum on that row) and each row computes with its own buffer's
+    // sample rate; _bioFftEpoch invalidates results computed before the
+    // latest LayoutBio.
     private bool _bioFftReady;
     private int _bioFftResultEpoch = -1;
     private string _bioFftMac = string.Empty;
-    private float[] _bioFftFreqs = new float[0];
-    private List<float[]> _bioFftMags = new List<float[]>();
+    private List<int> _bioFftResultRows = new List<int>();
+    private List<float[]> _bioFftResultFreqs = new List<float[]>();
+    private List<float[]> _bioFftResultMags = new List<float[]>();
     private long _bioFftLastSubmitMs;
     private int _bioFftEpoch;
-    private int[] _bioFftChannels = { -1, -1, -1, -1, -1, -1, -1, -1 };
+    private BioFftBinding[] _bioFftRows = new BioFftBinding[8];
+
+    private struct BioFftBinding
+    {
+        public RingBuffer Buffer;
+        public int Channel;
+        public BioFftBinding(RingBuffer buffer, int channel)
+        {
+            Buffer = buffer; Channel = channel;
+        }
+    }
 
     // Views (created in Start).
     private readonly List<WaveformView> _bioWaves = new List<WaveformView>();
@@ -200,8 +230,9 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     // NTF/FILTER/sample-rate control state
     private readonly Dictionary<string, Bool2> _ntfUi = new Dictionary<string, Bool2>();
     private readonly Dictionary<string, Bool2> _filterUi = new Dictionary<string, Bool2>();
-    private List<int> _rateOptionsUi = new List<int>();
-    private int _rateCurrentUi;
+    private readonly List<int>[] _rateOptionsUi =
+        { new List<int>(), new List<int>(), new List<int>(), new List<int>() };
+    private readonly int[] _rateCurrentUi = new int[SampleRateGroupCount];
     private bool _ntfHasInfo;
 
     // 3D quaternion cube (created in Start).
@@ -231,6 +262,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
 
         _ctrl = SensorController.Instance;
         _sdkVersion = _ctrl.GetVersion();
+        RefreshBackendLabel();
 
         _ctrl.EnableChanged += enabled => Post(() => OnBtEnableChanged(enabled));
         _ctrl.DeviceFound += devices => Post(() => OnScanResults(devices));
@@ -253,6 +285,16 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     private void OnDestroy()
     {
         _shuttingDown = true;
+        if (_replayStartThread != null)
+        {
+            _replayStartThread.Join();
+            _replayStartThread = null;
+        }
+        while (_uiQueue.TryDequeue(out Action pending))
+        {
+            try { pending(); }
+            catch (Exception ex) { Debug.LogWarning("[SensorDemo] ui action: " + ex.Message); }
+        }
         StopAll();
         if (_dataWorker != null)
         {
@@ -310,7 +352,6 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
 #endif
         yield return null;
     }
-
 
     // Android BLE bridge
     private void PlatformInit()
@@ -465,7 +506,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
             w.MarkDirty();
         for (int i = 0; i < _bioSpectra.Count; i++)
         {
-            if (i < _bioFftChannels.Length && _bioFftChannels[i] >= 0)
+            if (i < _bioFftRows.Length && _bioFftRows[i].Buffer != null)
                 _bioSpectra[i].MarkDirty();
         }
 
@@ -484,6 +525,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         RefreshValueLabels();
         RefreshBioSideTexts();
         RefreshGestureLabel();
+        RefreshBackendLabel();
 
         // 3D cube follows the latest quaternion sample.
         if (st != null && st.Quat.Allocated && st.Quat.Channels >= 4)
@@ -557,6 +599,9 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
 
     private void OnScanResults(List<BleDevice> devices)
     {
+        var present = new HashSet<string>();
+        foreach (BleDevice d in devices)
+            present.Add(d.Mac);
         foreach (BleDevice d in devices)
         {
             int found = _discovered.FindIndex(x => x.Mac == d.Mac);
@@ -569,10 +614,12 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
             else
             {
                 _discovered[found].Rssi = d.Rssi;
+                _discovered[found].MissedRounds = 0;
                 lock (_statesMutex)
                     UpdateDeviceItemText(d.Mac, _deviceStates.ContainsKey(d.Mac));
             }
         }
+        EvictStaleDevices(present);
     }
 
     // ------------------------------------------------------------------
@@ -623,6 +670,33 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         _rows.Insert(pos, row);
     }
 
+    private void EvictStaleDevices(HashSet<string> present)
+    {
+        // Rows absent from three consecutive scan rounds are dropped;
+        // connected devices and replay rows are exempt.
+        for (int i = _discovered.Count - 1; i >= 0; i--)
+        {
+            string mac = _discovered[i].Mac;
+            if (present.Contains(mac))
+                continue;
+            bool connected;
+            lock (_statesMutex)
+                connected = _deviceStates.ContainsKey(mac);
+            if (_replayMacs.Contains(mac) || connected)
+                continue;
+            if (++_discovered[i].MissedRounds < 4)
+                continue;
+            DeviceRow row = _rows.FirstOrDefault(r => r.Mac == mac);
+            if (row != null)
+                _rows.Remove(row);
+            // An evicted row is never connected, so _currentMac never
+            // points at it; only the visual selection is dropped.
+            if (_selectedMac == mac)
+                _selectedMac = string.Empty;
+            _discovered.RemoveAt(i);
+        }
+    }
+
     private void UiSelectDevice(string mac)
     {
         if (_replayMacs.Count > 0)
@@ -640,6 +714,8 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
 
     private void UiConnectSelected()
     {
+        if (_replayStarting)
+            return;
         string mac = _selectedMac;
         if (mac.Length == 0)
         {
@@ -651,6 +727,11 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         {
             if (_deviceStates.ContainsKey(mac))
                 return;
+        }
+        if (_ctrl.IsScanning)
+        {
+            _ctrl.StopScan();
+            _scanning = false;
         }
         ConnectDevice(mac);
     }
@@ -833,7 +914,8 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
             _ntfUi[key] = new Bool2(false, _ntfUi.TryGetValue(key, out Bool2 b) && b.Check);
         foreach (string key in FilterKeys)
             _filterUi[key] = new Bool2(false, _filterUi.TryGetValue(key, out Bool2 b) && b.Check);
-        _rateOptionsUi = new List<int>();
+        foreach (List<int> options in _rateOptionsUi)
+            options.Clear();
     }
 
     // ------------------------------------------------------------------
@@ -903,8 +985,11 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         _restoreParamsMacs.Remove(mac);
         st.NtfStates.Clear();
         st.FilterStates.Clear();
-        st.SampleRateOptions.Clear();
-        st.SampleRateCurrent = 0;
+        for (int kind = 0; kind < SampleRateGroupCount; kind++)
+        {
+            st.RateOptions(kind).Clear();
+            st.SetRateCurrent(kind, 0);
+        }
         lock (_statesMutex)
             _deviceStates.Remove(mac);
         AppLog($"App: device disconnected, removed from UI: {mac}");
@@ -947,12 +1032,10 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         st.Info = st.Profile.GetDeviceInfo();
         st.HasInfo = true;
         st.SyncSampleRates();
-        if (st.Info.EEGSampleRate > 0 && st.Info.EEGSampleRate != st.SampleRateCurrent)
-        {
-            st.SampleRateCurrent = st.Info.EEGSampleRate;
-            if (mac == _currentMac)
-                _rateCurrentUi = st.SampleRateCurrent;
-        }
+        SyncRateFromInfo(st, mac, 0, st.Info.EEGSampleRate);
+        SyncRateFromInfo(st, mac, 1, st.Info.EMGSampleRate);
+        SyncRateFromInfo(st, mac, 2, st.Info.AccSampleRate);
+        SyncRateFromInfo(st, mac, 3, st.Info.PpgSampleRate);
         if (mac == _currentMac)
         {
             _linkText = LinkTextOf(st.Info);
@@ -1060,25 +1143,55 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         ClearUiData();
     }
 
-    private async void OnSampleRateChecked(int rate)
+    private void OnSampleRateChecked(int kind, int rate)
     {
         if (_updatingControls)
             return;
         DeviceState st = CurrentState();
         if (st == null || !st.Profile.IsReady)
             return;
+        // Apply the selection now; the async setParam runs next frame.
+        st.SetRateCurrent(kind, rate);
+        _rateCurrentUi[kind] = rate;
+        string mac = st.Mac;
+        Post(() => ApplySampleRate(kind, mac, rate));
+    }
+
+    private async void ApplySampleRate(int kind, string mac, int rate)
+    {
+        DeviceState st = StateFor(mac);
+        if (st == null || !st.Profile.IsReady)
+            return;
+        string key = SampleRateKeys[kind];
         string value = rate.ToString();
-        string msg = await SendSetParam(st.Profile, "EEG_SAMPLE_RATE", value);
-        AppLog($"User: setParam(EEG_SAMPLE_RATE, {value}) -> {msg}");
-        RecordSavedParam(st.Mac, "EEG_SAMPLE_RATE", value, msg);
+        string msg = await SendSetParam(st.Profile, key, value);
+        AppLog($"User: setParam({key}, {value}) -> {msg}");
+        RecordSavedParam(st.Mac, key, value, msg);
         if (IsSetParamError(msg))
         {
-            ShowWarning("Set Parameter Failed", $"Failed to set EEG_SAMPLE_RATE:\n{msg}");
+            ShowWarning("Set Parameter Failed", $"Failed to set {key}:\n{msg}");
             RefreshControlStates(st);
             return;
         }
-        RefreshControlStates(CurrentState());
+        RefreshControlStates(st);
         ClearUiData();
+    }
+
+    private void SyncRateFromInfo(DeviceState st, string mac, int kind, int rate)
+    {
+        if (rate <= 0 || rate == st.RateCurrent(kind))
+            return;
+        st.SetRateCurrent(kind, rate);
+        if (mac == _currentMac)
+            _rateCurrentUi[kind] = rate;
+    }
+
+    private void SeedReplayRate(DeviceState st, int kind, int rate)
+    {
+        if (rate <= 0)
+            return;
+        st.SetRateCurrent(kind, rate);
+        _rateCurrentUi[kind] = rate;
     }
 
     private static async Task<string> SafeGetParam(SensorProfile profile, string key)
@@ -1093,6 +1206,27 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         }
     }
 
+    private static List<int> ParseRateOptions(string listResult)
+    {
+        var options = new List<int>();
+        if (!listResult.StartsWith("Error"))
+        {
+            foreach (string item in listResult.Split(new[] { '|' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                int rate;
+                if (int.TryParse(item, out rate))
+                    options.Add(rate);
+            }
+        }
+        return options;
+    }
+
+    private static int ParseRateCurrent(string rateResult)
+    {
+        int rate;
+        return !rateResult.StartsWith("Error") && int.TryParse(rateResult, out rate) ? rate : 0;
+    }
+
     private async void RefreshControlStates(DeviceState st)
     {
         if (st == null)
@@ -1100,16 +1234,21 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         string mac = st.Mac;
         string ntfResult = await SafeGetParam(st.Profile, "NTF");
         string filterResult = await SafeGetParam(st.Profile, "FILTER");
-        string rateListResult = await SafeGetParam(st.Profile, "EEG_SAMPLE_RATE_LIST");
-        string rateResult = await SafeGetParam(st.Profile, "EEG_SAMPLE_RATE");
+        var rateListResults = new string[SampleRateGroupCount];
+        var rateResults = new string[SampleRateGroupCount];
+        for (int kind = 0; kind < SampleRateGroupCount; kind++)
+        {
+            rateListResults[kind] = await SafeGetParam(st.Profile, SampleRateKeys[kind] + "_LIST");
+            rateResults[kind] = await SafeGetParam(st.Profile, SampleRateKeys[kind]);
+        }
         st = StateFor(mac);
         if (st == null)
             return;
-        ApplyRefreshedControlStates(st, ntfResult, filterResult, rateListResult, rateResult);
+        ApplyRefreshedControlStates(st, ntfResult, filterResult, rateListResults, rateResults);
     }
 
     private void ApplyRefreshedControlStates(DeviceState st, string ntfResult, string filterResult,
-                                             string rateListResult, string rateResult)
+                                             string[] rateListResults, string[] rateResults)
     {
         int emgCh = st.HasInfo ? st.Info.EMGChannelCount : 0;
         int eegCh = st.HasInfo ? st.Info.EEGChannelCount : 0;
@@ -1154,33 +1293,24 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
             filters[key] = new Bool2(hasFilter, hasFilter && parsed.TryGetValue(key, out v) && v == "ON");
         }
 
-        // EEG Sample Rate radios
-        var rateOptions = new List<int>();
-        if (!rateListResult.StartsWith("Error"))
+        // Sample Rate radios
+        for (int kind = 0; kind < SampleRateGroupCount; kind++)
         {
-            foreach (string item in rateListResult.Split(new[] { '|' }, StringSplitOptions.RemoveEmptyEntries))
-            {
-                int rate;
-                if (int.TryParse(item, out rate))
-                    rateOptions.Add(rate);
-            }
+            List<int> options = ParseRateOptions(rateListResults[kind]);
+            st.RateOptions(kind).Clear();
+            st.RateOptions(kind).AddRange(options);
+            st.SetRateCurrent(kind, ParseRateCurrent(rateResults[kind]));
         }
-        int rateCurrent = 0;
-        int rc;
-        if (!rateResult.StartsWith("Error") && int.TryParse(rateResult, out rc))
-            rateCurrent = rc;
 
         st.NtfStates = ntf;
         st.FilterStates = filters;
-        st.SampleRateOptions = rateOptions;
-        st.SampleRateCurrent = rateCurrent;
         if (st == CurrentState())
-            ApplyControlStates(ntf, filters, rateOptions, rateCurrent);
+            ApplyControlStates(ntf, filters, st);
     }
 
     private void ApplyControlStates(Dictionary<string, Bool2> ntf,
                                     Dictionary<string, Bool2> filters,
-                                    List<int> rateOptions, int rateCurrent)
+                                    DeviceState st)
     {
         _updatingControls = true;
         try
@@ -1196,8 +1326,14 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
                 Bool2 b;
                 _filterUi[key] = filters.TryGetValue(key, out b) ? b : new Bool2(false, false);
             }
-            _rateOptionsUi = rateOptions;
-            _rateCurrentUi = rateCurrent;
+            for (int kind = 0; kind < SampleRateGroupCount; kind++)
+            {
+                List<int> options = st != null ? st.RateOptions(kind) : null;
+                _rateOptionsUi[kind].Clear();
+                if (options != null)
+                    _rateOptionsUi[kind].AddRange(options);
+                _rateCurrentUi[kind] = st != null ? st.RateCurrent(kind) : 0;
+            }
         }
         finally
         {
@@ -1225,9 +1361,9 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
             "Documents",
             "sensorsdklog",
             DateTime.Now.ToString("yyyyMMdd_HHmmss") + "_" + version);
-        _ctrl.SetLogPath(true, dir);
-        _ctrl.SetDebugEnabled(true);
-        Debug.Log("[SensorDemo] setLogPath -> " + dir);
+        _ctrl.SetParam("LOG_PATH", dir);
+        _ctrl.SetParam("DEBUG_ENABLED", "True");
+        Debug.Log("[SensorDemo] LOG_PATH -> " + dir);
     }
 
     private void OnDebugLogToggled(bool enabled)
@@ -1237,7 +1373,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         if (enabled)
             ApplySdkDebugLog();
         else
-            _ctrl.SetDebugEnabled(false);
+            _ctrl.SetParam("DEBUG_ENABLED", "False");
         string value = enabled ? "True" : "False";
         foreach (DeviceState st in SnapshotStates())
         {
@@ -1345,9 +1481,11 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
 
     private static string LinkTextOf(DeviceInfo info)
     {
+        string backendPart = info.Backend.Length > 0 ? $" | backend {info.Backend}" : string.Empty;
         if (info.PeripheralLatency < 0 || info.ConnectionIntervalMs <= 0)
-            return "Link: --";
-        return $"Link: {info.ConnectionIntervalMs}ms / latency {info.PeripheralLatency} / timeout {info.SupervisionTimeoutMs}ms";
+            return "Link: --" + backendPart;
+        return $"Link: {info.ConnectionIntervalMs}ms / latency {info.PeripheralLatency} / timeout {info.SupervisionTimeoutMs}ms"
+               + backendPart;
     }
 
     private static string MtuTextOf(DeviceInfo info)
@@ -1384,8 +1522,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         }
         ApplyControlStates(st != null ? st.NtfStates : new Dictionary<string, Bool2>(),
                            st != null ? st.FilterStates : new Dictionary<string, Bool2>(),
-                           st != null ? st.SampleRateOptions : new List<int>(),
-                           st != null ? st.SampleRateCurrent : 0);
+                           st);
     }
 
     private void UpdateLostPacketLabel()
@@ -1404,6 +1541,22 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
             }
         }
         _lostPacketText = "Packet Loss Stats: None";
+    }
+
+    private void RefreshBackendLabel()
+    {
+        string backend;
+        try
+        {
+            backend = _ctrl.GetParam("BACK_END");
+        }
+        catch
+        {
+            return;
+        }
+        if (backend == _backendName)
+            return;
+        _backendName = backend;
     }
 
     private void RefreshGestureLabel()
@@ -1554,65 +1707,78 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         }
     }
 
-    // Per-channel spectra of the EMG/EEG bio rows: the bound rows' ring
-    // channels are snapshotted oldest -> newest and computed on the shared
-    // FFT worker; results whose device or bio layout no longer match are
-    // dropped.
+    // Per-row spectra of the bio rows: each bound row's ring channel is
+    // snapshotted oldest -> newest and computed on the shared FFT worker
+    // with its own buffer's sample rate; results whose device or bio
+    // layout no longer match are dropped.
     private void MaybeSubmitBioFft(DeviceState st)
     {
         if (st == null || _fftBusy)
             return;
         DeviceState.BioKind kind = st.GetBioKind();
-        if (kind != DeviceState.BioKind.EMG && kind != DeviceState.BioKind.EEG)
+        if (kind == DeviceState.BioKind.None)
             return;
-        var channels = new List<int>();
-        foreach (int c in _bioFftChannels)
+        bool anyBinding = false;
+        foreach (BioFftBinding b in _bioFftRows)
         {
-            if (c >= 0)
-                channels.Add(c);
+            if (b.Buffer != null)
+            {
+                anyBinding = true;
+                break;
+            }
         }
-        if (channels.Count == 0)
+        if (!anyBinding)
             return;
         long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         if (now - _bioFftLastSubmitMs < FftUpdateIntervalMs)
             return;
-        RingBuffer buf = kind == DeviceState.BioKind.EMG ? st.Emg : st.Eeg;
-        List<float[]> snapshot;
-        float rate;
+        var rows = new List<int>();
+        var snapshots = new List<float[]>();
+        var rates = new List<float>();
         lock (st.BufMutex)
         {
-            if (!buf.Allocated || buf.Length < 16 || buf.SampleRate <= 0)
-                return;
-            foreach (int c in channels)
+            for (int row = 0; row < _bioFftRows.Length; row++)
             {
-                if (c >= buf.Channels)
-                    return;
-            }
-            rate = buf.SampleRate;
-            // Reassemble the circular buffer oldest -> newest.
-            snapshot = new List<float[]>(channels.Count);
-            foreach (int c in channels)
-            {
-                var row = new float[buf.Length];
-                float[] src = buf.Samples[c];
+                BioFftBinding b = _bioFftRows[row];
+                RingBuffer buf = b.Buffer;
+                // A row whose buffer is not ready yet is skipped without
+                // affecting the other rows.
+                if (buf == null || !buf.Allocated || buf.Length < 16
+                    || buf.SampleRate <= 0 || b.Channel >= buf.Channels)
+                    continue;
+                // Reassemble the circular buffer oldest -> newest.
+                var snapshot = new float[buf.Length];
+                float[] src = buf.Samples[b.Channel];
                 for (int i = 0; i < buf.Length; i++)
-                    row[i] = src[(buf.WriteIndex + i) % buf.Length];
-                snapshot.Add(row);
+                    snapshot[i] = src[(buf.WriteIndex + i) % buf.Length];
+                rows.Add(row);
+                snapshots.Add(snapshot);
+                rates.Add(buf.SampleRate);
             }
         }
+        if (rows.Count == 0)
+            return;
         _bioFftLastSubmitMs = now;
         _fftBusy = true;
         int epoch = _bioFftEpoch;
         string mac = st.Mac;
         Task.Run(() =>
         {
-            float[] freqs;
-            List<float[]> mags;
-            SpectrumCompute.Compute(snapshot, rate, out freqs, out mags);
+            var allFreqs = new List<float[]>(rows.Count);
+            var allMags = new List<float[]>(rows.Count);
+            for (int k = 0; k < rows.Count; k++)
+            {
+                float[] freqs;
+                List<float[]> mags;
+                SpectrumCompute.Compute(new List<float[]> { snapshots[k] }, rates[k], out freqs, out mags);
+                allFreqs.Add(freqs);
+                allMags.Add(mags.Count == 0 ? new float[0] : mags[0]);
+            }
             lock (_fftMutex)
             {
-                _bioFftFreqs = freqs;
-                _bioFftMags = mags;
+                _bioFftResultRows = rows;
+                _bioFftResultFreqs = allFreqs;
+                _bioFftResultMags = allMags;
                 _bioFftResultEpoch = epoch;
                 _bioFftMac = mac;
                 _bioFftReady = true;
@@ -1633,14 +1799,14 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
             DeviceState st = CurrentState();
             if (st == null || _bioFftMac != st.Mac || _bioFftResultEpoch != _bioFftEpoch)
                 return;
-            int row = 0;
-            for (int i = 0; i < _bioSpectra.Count; i++)
+            for (int k = 0; k < _bioFftResultRows.Count; k++)
             {
-                if (i >= _bioFftChannels.Length || _bioFftChannels[i] < 0)
+                int row = _bioFftResultRows[k];
+                if (row >= _bioSpectra.Count || row >= _bioFftRows.Length
+                    || _bioFftRows[row].Buffer == null || _bioFftResultMags[k].Length == 0)
                     continue;
-                if (row < _bioFftMags.Count)
-                    _bioSpectra[i].SetResult(_bioFftFreqs, new List<float[]> { _bioFftMags[row] });
-                ++row;
+                _bioSpectra[row].SetResult(_bioFftResultFreqs[k],
+                                           new List<float[]> { _bioFftResultMags[k] });
             }
         }
     }
@@ -1714,9 +1880,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     {
         _bioTargets = new ImpedanceTarget[_bioWaves.Count];
         ++_bioFftEpoch;
-        _bioFftChannels = new int[_bioWaves.Count];
-        for (int i = 0; i < _bioFftChannels.Length; i++)
-            _bioFftChannels[i] = -1;
+        _bioFftRows = new BioFftBinding[_bioWaves.Count];
         DeviceState.BioKind kind = st != null ? st.GetBioKind() : DeviceState.BioKind.None;
         string waiting = st != null ? "Waiting for data ..." : "Not connected";
 
@@ -1732,7 +1896,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
                     _bioWaves[i].SetSource(st.Emg, st.BufMutex, i);
                     _bioWaves[i].SetLabels(new[] { $"EMG-{i + 1}" });
                     _bioWaves[i].SetPlaceholder(string.Empty);
-                    SetBioSpectrum(i, i, $"EMG-{i + 1}");
+                    SetBioSpectrum(i, st.Emg, i, i, $"EMG-{i + 1}");
                     _bioTargets[i] = new ImpedanceTarget(st.EmgImpedance, i);
                 }
                 else
@@ -1763,7 +1927,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
                     _bioWaves[i].SetSource(st.Eeg, st.BufMutex, eegCh);
                     _bioWaves[i].SetLabels(new[] { $"EEG-{eegCh + 1}" });
                     _bioWaves[i].SetPlaceholder(string.Empty);
-                    SetBioSpectrum(i, eegCh, $"EEG-{eegCh + 1}");
+                    SetBioSpectrum(i, st.Eeg, eegCh, eegCh, $"EEG-{eegCh + 1}");
                     _bioTargets[i] = new ImpedanceTarget(st.EegImpedance, eegCh);
                 }
                 else if (hasECG && i == ecgIndex && st.Ecg.Allocated)
@@ -1771,7 +1935,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
                     _bioWaves[i].SetSource(st.Ecg, st.BufMutex, 0);
                     _bioWaves[i].SetLabels(new[] { "ECG" });
                     _bioWaves[i].SetPlaceholder(string.Empty);
-                    SetBioSpectrum(i, -1, string.Empty);
+                    SetBioSpectrum(i, st.Ecg, 0, 0, "ECG");
                     _bioTargets[i] = new ImpedanceTarget(st.EcgImpedance, 0);
                 }
                 else if (hasBRTH && i == brthIndex && st.Brth.Allocated)
@@ -1779,7 +1943,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
                     _bioWaves[i].SetSource(st.Brth, st.BufMutex, 0);
                     _bioWaves[i].SetLabels(new[] { "BRTH" });
                     _bioWaves[i].SetPlaceholder(string.Empty);
-                    SetBioSpectrum(i, -1, string.Empty);
+                    SetBioSpectrum(i, null, -1, -1, string.Empty);
                     _bioTargets[i] = new ImpedanceTarget(st.BrthImpedance, 0);
                 }
                 else
@@ -1795,12 +1959,12 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
             _bioTitle = "EEG + PPG + SpO2 Waveform";
             var plotConfig = new PpgPlot[]
             {
-                new PpgPlot(st.Eeg, 0, "fp1", true),
-                new PpgPlot(st.Eeg, 1, "fp2", true),
-                new PpgPlot(st.Ppg, 0, "red_led", false),
-                new PpgPlot(st.Ppg, 1, "ir_led", false),
-                new PpgPlot(st.Spo2, 0, "spo2", false),
-                new PpgPlot(st.Spo2, 1, "heart_rate", false),
+                new PpgPlot(st.Eeg, 0, "fp1", true, true),
+                new PpgPlot(st.Eeg, 1, "fp2", true, true),
+                new PpgPlot(st.Ppg, 0, "red_led", false, true),
+                new PpgPlot(st.Ppg, 1, "ir_led", false, true),
+                new PpgPlot(st.Spo2, 0, "spo2", false, false),
+                new PpgPlot(st.Spo2, 1, "heart_rate", false, false),
             };
             for (int i = 0; i < _bioWaves.Count; i++)
             {
@@ -1813,7 +1977,10 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
                         _bioWaves[i].SetSource(cfg.Buffer, st.BufMutex, cfg.Channel, i);
                         _bioWaves[i].SetLabels(new[] { cfg.Label });
                         _bioWaves[i].SetPlaceholder(string.Empty);
-                        SetBioSpectrum(i, -1, string.Empty);
+                        if (cfg.HasFft)
+                            SetBioSpectrum(i, cfg.Buffer, cfg.Channel, i, cfg.Label);
+                        else
+                            SetBioSpectrum(i, null, -1, -1, string.Empty);
                         _bioTargets[i] = cfg.IsEeg
                             ? new ImpedanceTarget(st.EegImpedance, cfg.Channel)
                             : new ImpedanceTarget(null, 0);
@@ -1841,20 +2008,22 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         public int Channel;
         public string Label;
         public bool IsEeg;
-        public PpgPlot(RingBuffer buffer, int channel, string label, bool isEeg)
+        public bool HasFft;
+        public PpgPlot(RingBuffer buffer, int channel, string label, bool isEeg, bool hasFft)
         {
-            Buffer = buffer; Channel = channel; Label = label; IsEeg = isEeg;
+            Buffer = buffer; Channel = channel; Label = label; IsEeg = isEeg; HasFft = hasFft;
         }
     }
 
-    // Row spectrum binding: channel >= 0 shows the row's spectrum, -1 hides
-    // it (the waveform then spans the full row width).
-    private void SetBioSpectrum(int row, int channel, string label)
+    // Row spectrum binding: buffer != null shows the row's spectrum
+    // (computed with that buffer's own sample rate), null hides it (the
+    // waveform then spans the full row width).
+    private void SetBioSpectrum(int row, RingBuffer buffer, int channel, int colorIndex, string label)
     {
-        if (channel >= 0)
+        if (buffer != null && channel >= 0)
         {
-            _bioFftChannels[row] = channel;
-            _bioSpectra[row].SetColorIndex(channel);
+            _bioFftRows[row] = new BioFftBinding(buffer, channel);
+            _bioSpectra[row].SetColorIndex(colorIndex);
             _bioSpectra[row].SetLabels(new[] { label });
             _bioSpectra[row].SetPlaceholder(string.Empty);
         }
@@ -1870,7 +2039,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         _bioWaves[i].SetLabels(new string[0]);
         _bioWaves[i].SetPlaceholder(placeholder);
         _bioWaves[i].SetSideText(string.Empty, Color.white);
-        SetBioSpectrum(i, -1, string.Empty);
+        SetBioSpectrum(i, null, -1, -1, string.Empty);
         _bioTargets[i] = new ImpedanceTarget(null, 0);
     }
 
@@ -1883,9 +2052,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         _cube = GameObject.CreatePrimitive(PrimitiveType.Cube);
         _cube.name = "SensorDemoCube";
         _cube.layer = 8;
-        _cube.transform.localScale = Vector3.one * 1.5f;
-        _cube.transform.localPosition = new Vector3(0f, -0.5f, 0f);
-        
+        _cube.transform.localScale = Vector3.one * 2;
 
         // Six faces, one submesh + one flat color each
         var mf = _cube.GetComponent<MeshFilter>();
@@ -1921,7 +2088,9 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         new Color32(60, 160, 60, 255),     // -X
         new Color32(60, 100, 220, 255),    // +X
     };
-    
+
+    // Flat always-opaque material (no lighting, no transparency); the
+    // SensorDemo/CubeFace shader multiplies the mesh vertex colors.
     private static Material CreateFlatMaterial(Color32 tint)
     {
         Shader shader = Shader.Find("SensorDemo/CubeFace");
@@ -2135,12 +2304,61 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         }
     }
 
+    // Check Setup Dongle button
+    private void UiCheckDongle()
+    {
+        if (_dongleChecking || _ctrl == null)
+            return;
+        AppLog("User: check setup dongle");
+        _dongleChecking = true;
+        var t = new Thread(() =>
+        {
+            string result;
+            try
+            {
+                result = _ctrl.CheckSetupDongle();
+            }
+            catch (Exception ex)
+            {
+                result = "Error: " + ex.Message;
+            }
+            Post(() =>
+            {
+                _dongleChecking = false;
+                string firstLine = result.Split('\n')[0].Trim();
+                AppLog("App: check dongle result: " + firstLine);
+                if (result.StartsWith("OK"))
+                {
+                    string msg = "USB BLE dongle is ready (driver installed and usable by the SDK).";
+                    int colon = firstLine.IndexOf(':');
+                    if (colon >= 0)
+                        msg += "\nUsable dongle count: " + firstLine.Substring(colon + 1).Trim();
+                    int nl = result.IndexOf('\n');
+                    if (nl >= 0)
+                    {
+                        string extra = result.Substring(nl + 1).Trim();
+                        if (extra.Length > 0)
+                            msg += "\n" + extra;
+                    }
+                    ShowWarning("Check Setup Dongle", msg);
+                }
+                else
+                {
+                    ShowWarning("Check Setup Dongle", result);
+                }
+            });
+        }) { IsBackground = true, Name = "DongleCheck" };
+        t.Start();
+    }
+
     // ------------------------------------------------------------------
     // Bin replay / analyze
     // ------------------------------------------------------------------
 
     private void UiStartReplay()
     {
+        if (_replayStarting)
+            return;
         if (BinFileDialog.IsSupported)
         {
             string picked = BinFileDialog.OpenBin(false, DefaultBinDir());
@@ -2159,6 +2377,8 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     // Multi Replay Bin button
     private void UiMultiReplay()
     {
+        if (_replayStarting)
+            return;
         if (BinFileDialog.IsSupported)
         {
             string picked = BinFileDialog.OpenBin(true, DefaultBinDir());
@@ -2182,6 +2402,8 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
 
     private void StartReplay()
     {
+        if (_replayStarting)
+            return;
         lock (_statesMutex)
         {
             if (_deviceStates.Count > 0)
@@ -2209,68 +2431,56 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
             _statusText = "Type the bin path into the bin field first";
             return;
         }
-        if (paths.Count > 1)
+        if (paths.Count == 1 && !File.Exists(paths[0]))
         {
-            StartMultiReplay(paths);
+            _statusText = "bin not found: " + paths[0];
             return;
         }
-        string path = paths[0];
-        if (!File.Exists(path))
+        AppLog(paths.Count > 1
+            ? $"User: replay {paths.Count} bin files: {string.Join("; ", paths.ToArray())}"
+            : $"User: replay bin file: {paths[0]}");
+        _replayStarting = true;
+        if (_replayStartThread != null && _replayStartThread.IsAlive)
+            _replayStartThread.Join();
+        _replayStartThread = new Thread(() =>
         {
-            _statusText = "bin not found: " + path;
-            return;
-        }
-        AppLog($"User: replay bin file: {path}");
+            ReplayStartResult r = paths.Count > 1
+                ? QueryMultiReplay(paths)
+                : QuerySingleReplay(paths[0]);
+            Post(() => FinishStartReplay(r));
+        }) { IsBackground = true, Name = "ReplayStart" };
+        _replayStartThread.Start();
+    }
+
+    private sealed class ReplayStartResult
+    {
+        public List<string> Paths;
+        public List<BinFileInfo> Infos;
+        public SensorProfile[] Profiles;
+        public string WarnLog;
+        public string ErrorStatus;
+    }
+
+    private ReplayStartResult QuerySingleReplay(string path)
+    {
+        var r = new ReplayStartResult();
         BinFileInfo info = _ctrl.GetBinFileInfo(path);
         if (info == null || !info.Valid || info.Mac.Length == 0)
         {
-            AppLog($"App: invalid bin file (no config record): {path}", "W");
-            _statusText = "Invalid bin file: no config record found";
-            return;
+            r.WarnLog = $"App: invalid bin file (no config record): {path}";
+            r.ErrorStatus = "Invalid bin file: no config record found";
+            return r;
         }
         SensorProfile profile = _ctrl.ReplayBinFile(path, info.Mac, true, ReplayDelegateTimeoutMs);
-        if (profile == null)
-        {
-            _statusText = "Replay failed to start";
-            return;
-        }
-        HookProfileEvents(profile);
-
-        _replayMacs.Add(info.Mac);
-        _replayStopRequested = false;
-        _replayPaused = false;
-
-        var st = new DeviceState(profile)
-        {
-            IsReplay = true,
-            FlowStarted = true,
-            Name = info.DeviceName,
-        };
-        st.LiveFilterState.SetBand(_filterBand);
-        lock (_statesMutex)
-            _deviceStates[info.Mac] = st;
-
-        var row = new DeviceRow(info.Mac, $"[Replay] {st.Name}, Address: {info.Mac}");
-        _rows.Add(row);
-        _selectedMac = info.Mac;
-        _currentMac = info.Mac;
-
-        // Sync the sample-rate radio checked state
-        if (info.DeviceInfo.EEGSampleRate > 0)
-        {
-            st.SampleRateCurrent = info.DeviceInfo.EEGSampleRate;
-            _rateCurrentUi = st.SampleRateCurrent;
-        }
-
-        RetargetWaveforms();
-        RefreshInfoPanel();
-        _statusText = $"Replaying: {Path.GetFileName(path)} (duration {info.DurationSec:F1}s, realtime) ...";
+        r.Paths = new List<string> { path };
+        r.Infos = new List<BinFileInfo> { info };
+        r.Profiles = new SensorProfile[] { profile };
+        return r;
     }
 
-    // Multi-bin synchronized replay
-    private void StartMultiReplay(List<string> paths)
+    private ReplayStartResult QueryMultiReplay(List<string> paths)
     {
-        AppLog($"User: replay {paths.Count} bin files: {string.Join("; ", paths.ToArray())}");
+        var r = new ReplayStartResult();
         var infos = new List<BinFileInfo>();
         var macs = new List<string>();
         foreach (string path in paths)
@@ -2278,33 +2488,50 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
             BinFileInfo info = _ctrl.GetBinFileInfo(path);
             if (info == null || !info.Valid || info.Mac.Length == 0)
             {
-                AppLog($"App: invalid bin file (no config record): {path}", "W");
-                _statusText = "Invalid bin file: no config record found";
-                return;
+                r.WarnLog = $"App: invalid bin file (no config record): {path}";
+                r.ErrorStatus = "Invalid bin file: no config record found";
+                return r;
             }
             if (macs.Contains(info.Mac))
             {
-                AppLog($"App: duplicate replay mac {info.Mac}: {path}", "W");
-                _statusText = "Duplicate device in bin files: " + info.Mac;
-                return;
+                r.WarnLog = $"App: duplicate replay mac {info.Mac}: {path}";
+                r.ErrorStatus = "Duplicate device in bin files: " + info.Mac;
+                return r;
             }
             infos.Add(info);
             macs.Add(info.Mac);
         }
         SensorProfile[] profiles = _ctrl.MultiReplayBinFile(
             paths.ToArray(), macs.ToArray(), true, ReplayDelegateTimeoutMs);
-        BinFileInfo firstInfo = null;
-        for (int i = 0; i < profiles.Length; i++)
+        r.Paths = paths;
+        r.Infos = infos;
+        r.Profiles = profiles;
+        return r;
+    }
+
+    private void FinishStartReplay(ReplayStartResult r)
+    {
+        _replayStarting = false;
+        if (r.ErrorStatus != null)
         {
-            SensorProfile member = profiles[i];
+            if (r.WarnLog != null)
+                AppLog(r.WarnLog, "W");
+            _statusText = r.ErrorStatus;
+            return;
+        }
+        BinFileInfo firstInfo = null;
+        for (int i = 0; i < r.Profiles.Length; i++)
+        {
+            SensorProfile member = r.Profiles[i];
             if (member == null)
             {
-                AppLog($"App: replay failed to start: {paths[i]}", "W");
+                if (r.Paths.Count > 1)
+                    AppLog($"App: replay failed to start: {r.Paths[i]}", "W");
                 continue;
             }
             HookProfileEvents(member);
 
-            BinFileInfo info = infos[i];
+            BinFileInfo info = r.Infos[i];
             _replayMacs.Add(info.Mac);
             if (firstInfo == null)
                 firstInfo = info;
@@ -2334,15 +2561,16 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
 
         // Sync the sample-rate radio checked state
         DeviceState first = StateFor(_replayMacs[0]);
-        if (firstInfo.DeviceInfo.EEGSampleRate > 0)
-        {
-            first.SampleRateCurrent = firstInfo.DeviceInfo.EEGSampleRate;
-            _rateCurrentUi = first.SampleRateCurrent;
-        }
+        SeedReplayRate(first, 0, firstInfo.DeviceInfo.EEGSampleRate);
+        SeedReplayRate(first, 1, firstInfo.DeviceInfo.EMGSampleRate);
+        SeedReplayRate(first, 2, firstInfo.DeviceInfo.AccSampleRate);
+        SeedReplayRate(first, 3, firstInfo.DeviceInfo.PpgSampleRate);
 
         RetargetWaveforms();
         RefreshInfoPanel();
-        _statusText = $"Replaying: {_replayMacs.Count} bin files (realtime) ...";
+        _statusText = r.Paths.Count > 1
+            ? $"Replaying: {_replayMacs.Count} bin files (realtime) ..."
+            : $"Replaying: {Path.GetFileName(r.Paths[0])} (duration {firstInfo.DurationSec:F1}s, realtime) ...";
     }
 
     private void UiReplayPauseResume()
