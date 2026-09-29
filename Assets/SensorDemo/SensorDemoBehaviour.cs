@@ -36,12 +36,12 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     private const int CmdTimeoutMs = 5000;
     private const int PlotUpdateIntervalMs = 50;
     private const int FftUpdateIntervalMs = 200;
-    private const string DemoVersion = "0.1.19";
+    private const string DemoVersion = "0.1.25";
     private const int PowerRefreshPeriodMs = 60000;
     private const int PowerStableBand = 4;
     private const uint ReplayDelegateTimeoutMs = 5000;
 
-    private static readonly string[] NtfKeys = { "NTF_EEG", "NTF_EMG", "NTF_GEST", "NTF_PPG", "NTF_SPO2", "NTF_IMU" };
+    private static readonly string[] NtfKeys = { "NTF_EEG", "NTF_IMPEDANCE", "NTF_EMG", "NTF_GEST", "NTF_PPG", "NTF_SPO2", "NTF_IMU", "NTF_MAG_ANGLE" };
     private static readonly string[] FilterKeys = { "FILTER_50HZ", "FILTER_60HZ", "FILTER_HPF", "FILTER_LPF" };
     // Sample-rate groups: 0 = EEG, 1 = EMG, 2 = IMU, 3 = PPG
     private const int SampleRateGroupCount = 4;
@@ -58,8 +58,9 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     };
     private static readonly Dictionary<string, string> NtfLabels = new Dictionary<string, string>
     {
-        ["NTF_EEG"] = "EEG", ["NTF_EMG"] = "EMG", ["NTF_GEST"] = "GESTURE",
+        ["NTF_EEG"] = "EEG", ["NTF_IMPEDANCE"] = "IMPE", ["NTF_EMG"] = "EMG", ["NTF_GEST"] = "GESTURE",
         ["NTF_PPG"] = "PPG", ["NTF_SPO2"] = "SpO2", ["NTF_IMU"] = "IMU",
+        ["NTF_MAG_ANGLE"] = "Angle",
     };
     private static readonly Dictionary<string, string> FilterLabels = new Dictionary<string, string>
     {
@@ -75,6 +76,8 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     private SensorController _ctrl;
     private string _sdkVersion = "";
     private string _backendName = "";
+    private bool _backendQueryPending;
+    private long _backendQueryTicks;
 
     private readonly ConcurrentQueue<Action> _uiQueue = new ConcurrentQueue<Action>();
 
@@ -121,6 +124,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     private readonly Dictionary<string, string> _lastDataPaths = new Dictionary<string, string>();
     private bool _debugLogEnabled = true;
     private bool _binDataEnabled = true;
+    private bool _dongleDebugEnabled = true;
     private bool _autoReconnect = true;
     private bool _dongleChecking;
 
@@ -274,6 +278,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
 
         if (_debugLogEnabled)
             ApplySdkDebugLog();
+        ApplyDongleDebug();
 
         PlatformInit();
 
@@ -516,7 +521,8 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         PollBioFftResult();
         MaybeSubmitBioFft(st);
 
-        bool bioReady = st != null && ((st.GetBioKind() == DeviceState.BioKind.EMG && st.Emg.Allocated)
+        bool bioReady = st != null && ((st.GetBioKind() == DeviceState.BioKind.EMG
+                                        && (st.Emg.Allocated || st.MagAngle.Allocated))
                                        || (st.GetBioKind() == DeviceState.BioKind.EEG && st.Eeg.Allocated)
                                        || (st.GetBioKind() == DeviceState.BioKind.PPG && st.Ppg.Allocated));
         if (bioReady && _bioWaves.Count > 0 && !_bioWaves[0].HasSource)
@@ -1029,7 +1035,10 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         DeviceState st = StateFor(mac);
         if (st == null)
             return;
-        st.Info = st.Profile.GetDeviceInfo();
+        DeviceInfo info = st.Profile.GetDeviceInfo();
+        if (info == null)
+            return;
+        st.Info = info;
         st.HasInfo = true;
         st.SyncSampleRates();
         SyncRateFromInfo(st, mac, 0, st.Info.EEGSampleRate);
@@ -1255,14 +1264,18 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         int imuCh = st.HasInfo ? Math.Max(st.Info.AccChannelCount, st.Info.GyroChannelCount) : 0;
         int ppgCh = st.HasInfo ? st.Info.PpgChannelCount : 0;
         int spo2Ch = st.HasInfo ? st.Info.Spo2ChannelCount : 0;
+        int magCh = st.HasInfo ? st.Info.MagAngleChannelCount : 0;
+        int impeCh = st.HasInfo ? st.Info.ImpeChannelCount : 0;
         var channelMap = new Dictionary<string, int>
         {
             ["NTF_EEG"] = eegCh,
+            ["NTF_IMPEDANCE"] = impeCh,
             ["NTF_EMG"] = emgCh,
             ["NTF_GEST"] = emgCh,
             ["NTF_PPG"] = ppgCh,
             ["NTF_SPO2"] = spo2Ch,
             ["NTF_IMU"] = imuCh,
+            ["NTF_MAG_ANGLE"] = magCh,
         };
 
         var ntf = new Dictionary<string, Bool2>();
@@ -1304,6 +1317,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
 
         st.NtfStates = ntf;
         st.FilterStates = filters;
+        st.ImpedanceEnabled = ntf.TryGetValue("NTF_IMPEDANCE", out Bool2 impe) && impe.Enabled && impe.Check;
         if (st == CurrentState())
             ApplyControlStates(ntf, filters, st);
     }
@@ -1361,8 +1375,8 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
             "Documents",
             "sensorsdklog",
             DateTime.Now.ToString("yyyyMMdd_HHmmss") + "_" + version);
-        _ctrl.SetParam("LOG_PATH", dir);
-        _ctrl.SetParam("DEBUG_ENABLED", "True");
+        _ = _ctrl.SetParamAsync("LOG_PATH", dir);
+        _ = _ctrl.SetParamAsync("DEBUG_ENABLED", "True");
         Debug.Log("[SensorDemo] LOG_PATH -> " + dir);
     }
 
@@ -1373,7 +1387,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         if (enabled)
             ApplySdkDebugLog();
         else
-            _ctrl.SetParam("DEBUG_ENABLED", "False");
+            _ = _ctrl.SetParamAsync("DEBUG_ENABLED", "False");
         string value = enabled ? "True" : "False";
         foreach (DeviceState st in SnapshotStates())
         {
@@ -1394,6 +1408,20 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
                 continue;
             _ = PushDebugPathParam(st, "DEBUG_BLE_DATA_PATH", value);
         }
+    }
+
+    private void ApplyDongleDebug()
+    {
+        string value = _dongleDebugEnabled ? "True" : "False";
+        _ = _ctrl.SetParamAsync("BLE_TRACE_ENABLED", value);
+        Debug.Log("[SensorDemo] BLE_TRACE_ENABLED -> " + value);
+    }
+
+    private void OnDongleDebugToggled(bool enabled)
+    {
+        _dongleDebugEnabled = enabled;
+        AppLog($"User: dongle debug {(enabled ? "ON" : "OFF")}");
+        ApplyDongleDebug();
     }
 
     private async Task PushDebugPathParam(DeviceState st, string key, string value)
@@ -1545,18 +1573,35 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
 
     private void RefreshBackendLabel()
     {
+        if (_backendQueryPending)
+            return;
+        long now = DateTime.UtcNow.Ticks;
+        if (now - _backendQueryTicks < TimeSpan.TicksPerSecond)
+            return;
+        _backendQueryTicks = now;
+        _backendQueryPending = true;
+        _ = RefreshBackendLabelAsync();
+    }
+
+    private async Task RefreshBackendLabelAsync()
+    {
         string backend;
         try
         {
-            backend = _ctrl.GetParam("BACK_END");
+            backend = await _ctrl.GetParamAsync("BACK_END");
         }
         catch
         {
+            Post(() => _backendQueryPending = false);
             return;
         }
-        if (backend == _backendName)
-            return;
-        _backendName = backend;
+        Post(() =>
+        {
+            _backendQueryPending = false;
+            if (backend.StartsWith("Error") || backend == _backendName)
+                return;
+            _backendName = backend;
+        });
     }
 
     private void RefreshGestureLabel()
@@ -1588,6 +1633,11 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         {
             for (int i = 0; i < _bioWaves.Count; i++)
             {
+                if (!st.ImpedanceEnabled)
+                {
+                    _bioWaves[i].SetSideText(string.Empty, Color.white);
+                    continue;
+                }
                 ImpedanceTarget t = _bioTargets[i];
                 if (t.Impedance == null || t.Channel >= t.Impedance.Count || t.Impedance[t.Channel] < 0)
                     continue;
@@ -1862,7 +1912,8 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         if (st == null || st.GetBioKind() != DeviceState.BioKind.EEG)
             return 1;
         int extras = (st.Info.ECGChannelCount > 0 ? 1 : 0)
-                   + (st.Info.BRTHChannelCount > 0 ? 1 : 0);
+                   + (st.Info.BRTHChannelCount > 0 ? 1 : 0)
+                   + (st.Info.MagAngleChannelCount > 0 ? 1 : 0);
         int perPage = _bioWaves.Count - extras;
         int total = st.Info.EEGChannelCount > 0 ? st.Info.EEGChannelCount
                   : st.Eeg.Allocated ? st.Eeg.Channels : 0;
@@ -1886,18 +1937,34 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
 
         if (kind == DeviceState.BioKind.EMG && st != null)
         {
-            // EMG device
-            _bioTitle = "EMG Waveform";
-            int emgCh = st.Emg.Allocated ? Math.Min(st.Emg.Channels, _bioWaves.Count) : 0;
+            // EMG device: up to 8 EMG channels, no paging. A mag-angle
+            // stream takes the row right after the EMG channel rows (a
+            // mag-only device uses this mode too).
+            bool hasMag = st.Info.MagAngleChannelCount > 0 || st.MagAngle.Allocated;
+            int emgCh = st.Emg.Allocated ? Math.Min(st.Emg.Channels, _bioWaves.Count - (hasMag ? 1 : 0)) : 0;
+            int magIndex = emgCh;
+            _bioTitle = hasMag && emgCh > 0 ? "EMG + Angle Waveform"
+                      : hasMag ? "Angle Waveform"
+                               : "EMG Waveform";
             for (int i = 0; i < _bioWaves.Count; i++)
             {
                 if (i < emgCh)
                 {
                     _bioWaves[i].SetSource(st.Emg, st.BufMutex, i);
+                    _bioWaves[i].SetAutoYRange();
                     _bioWaves[i].SetLabels(new[] { $"EMG-{i + 1}" });
                     _bioWaves[i].SetPlaceholder(string.Empty);
                     SetBioSpectrum(i, st.Emg, i, i, $"EMG-{i + 1}");
                     _bioTargets[i] = new ImpedanceTarget(st.EmgImpedance, i);
+                }
+                else if (hasMag && i == magIndex && st.MagAngle.Allocated)
+                {
+                    _bioWaves[i].SetSource(st.MagAngle, st.BufMutex, 0, i);
+                    _bioWaves[i].SetFixedYRange(0.0, 180.0);
+                    _bioWaves[i].SetLabels(new[] { "Angle" });
+                    _bioWaves[i].SetPlaceholder(string.Empty);
+                    SetBioSpectrum(i, st.MagAngle, 0, i, "Angle");
+                    _bioTargets[i] = new ImpedanceTarget(null, 0);
                 }
                 else
                 {
@@ -1907,11 +1974,14 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         }
         else if (kind == DeviceState.BioKind.EEG && st != null)
         {
-            // EEG device
-            _bioTitle = "EEG + ECG + BRTH Waveform";
+            // EEG device: the extra rows sit at the bottom, BRTH last,
+            // ECG above it, Angle above ECG.
             bool hasECG = st.Info.ECGChannelCount > 0 || st.Ecg.Allocated;
             bool hasBRTH = st.Info.BRTHChannelCount > 0 || st.Brth.Allocated;
-            int perPage = _bioWaves.Count - (hasECG ? 1 : 0) - (hasBRTH ? 1 : 0);
+            bool hasMag = st.Info.MagAngleChannelCount > 0 || st.MagAngle.Allocated;
+            _bioTitle = hasMag ? "EEG + ECG + BRTH + Angle Waveform"
+                               : "EEG + ECG + BRTH Waveform";
+            int perPage = _bioWaves.Count - (hasECG ? 1 : 0) - (hasBRTH ? 1 : 0) - (hasMag ? 1 : 0);
             int total = st.Info.EEGChannelCount > 0 ? st.Info.EEGChannelCount
                       : st.Eeg.Allocated ? st.Eeg.Channels : 0;
             int pages = Math.Max(1, (total + perPage - 1) / perPage);
@@ -1919,12 +1989,14 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
             int startCh = _bioPage * perPage;
             int ecgIndex = _bioWaves.Count - 1 - (hasBRTH ? 1 : 0);
             int brthIndex = _bioWaves.Count - 1;
+            int magIndex = ecgIndex - (hasECG ? 1 : 0);
             for (int i = 0; i < _bioWaves.Count; i++)
             {
                 int eegCh = startCh + i;
                 if (i < perPage && eegCh < total && st.Eeg.Allocated)
                 {
                     _bioWaves[i].SetSource(st.Eeg, st.BufMutex, eegCh);
+                    _bioWaves[i].SetAutoYRange();
                     _bioWaves[i].SetLabels(new[] { $"EEG-{eegCh + 1}" });
                     _bioWaves[i].SetPlaceholder(string.Empty);
                     SetBioSpectrum(i, st.Eeg, eegCh, eegCh, $"EEG-{eegCh + 1}");
@@ -1933,6 +2005,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
                 else if (hasECG && i == ecgIndex && st.Ecg.Allocated)
                 {
                     _bioWaves[i].SetSource(st.Ecg, st.BufMutex, 0);
+                    _bioWaves[i].SetAutoYRange();
                     _bioWaves[i].SetLabels(new[] { "ECG" });
                     _bioWaves[i].SetPlaceholder(string.Empty);
                     SetBioSpectrum(i, st.Ecg, 0, 0, "ECG");
@@ -1941,10 +2014,20 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
                 else if (hasBRTH && i == brthIndex && st.Brth.Allocated)
                 {
                     _bioWaves[i].SetSource(st.Brth, st.BufMutex, 0);
+                    _bioWaves[i].SetAutoYRange();
                     _bioWaves[i].SetLabels(new[] { "BRTH" });
                     _bioWaves[i].SetPlaceholder(string.Empty);
                     SetBioSpectrum(i, null, -1, -1, string.Empty);
                     _bioTargets[i] = new ImpedanceTarget(st.BrthImpedance, 0);
+                }
+                else if (hasMag && i == magIndex && st.MagAngle.Allocated)
+                {
+                    _bioWaves[i].SetSource(st.MagAngle, st.BufMutex, 0, i);
+                    _bioWaves[i].SetFixedYRange(0.0, 180.0);
+                    _bioWaves[i].SetLabels(new[] { "Angle" });
+                    _bioWaves[i].SetPlaceholder(string.Empty);
+                    SetBioSpectrum(i, st.MagAngle, 0, i, "Angle");
+                    _bioTargets[i] = new ImpedanceTarget(null, 0);
                 }
                 else
                 {
@@ -1975,6 +2058,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
                     if (cfg.Buffer.Allocated && cfg.Channel < cfg.Buffer.Channels)
                     {
                         _bioWaves[i].SetSource(cfg.Buffer, st.BufMutex, cfg.Channel, i);
+                        _bioWaves[i].SetAutoYRange();
                         _bioWaves[i].SetLabels(new[] { cfg.Label });
                         _bioWaves[i].SetPlaceholder(string.Empty);
                         if (cfg.HasFft)
@@ -2036,6 +2120,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     private void ClearBioSlot(int i, string placeholder)
     {
         _bioWaves[i].SetSource(null, null, i);
+        _bioWaves[i].SetAutoYRange();
         _bioWaves[i].SetLabels(new string[0]);
         _bioWaves[i].SetPlaceholder(placeholder);
         _bioWaves[i].SetSideText(string.Empty, Color.white);
@@ -2242,7 +2327,8 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
                     return;
                 }
             }
-            Dictionary<string, bool> result = await MultiStartWithModelParams(participants);
+            Dictionary<string, bool> result =
+                await _ctrl.MultiStartDataNotificationAsync(ProfilesOf(participants));
             List<string> failed = FailedMacs(result);
             if (failed.Count > 0)
             {
@@ -2259,17 +2345,6 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
             _statusText = "Multi start failed: " + ex.Message;
             AppLog("App: " + _statusText, "W");
         }
-    }
-
-    // Model-aware start parameters
-    private Task<Dictionary<string, bool>> MultiStartWithModelParams(List<DeviceState> participants)
-    {
-        var modelNames = new HashSet<string>();
-        foreach (DeviceState st in participants)
-            modelNames.Add(st.HasInfo ? st.Info.ModelName : null);
-        if (modelNames.Count == 1 && !modelNames.Contains(null))
-            return _ctrl.MultiStartDataNotificationAsync(ProfilesOf(participants));
-        return _ctrl.MultiStartDataNotificationAsync(ProfilesOf(participants), 60000, -1, 5);
     }
 
     private async void UiMultiStop()
@@ -2305,50 +2380,43 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     }
 
     // Check Setup Dongle button
-    private void UiCheckDongle()
+    private async void UiCheckDongle()
     {
         if (_dongleChecking || _ctrl == null)
             return;
         AppLog("User: check setup dongle");
         _dongleChecking = true;
-        var t = new Thread(() =>
+        string result;
+        try
         {
-            string result;
-            try
+            result = await _ctrl.CheckSetupDongleAsync();
+        }
+        catch (Exception ex)
+        {
+            result = "Error: " + ex.Message;
+        }
+        _dongleChecking = false;
+        string firstLine = result.Split('\n')[0].Trim();
+        AppLog("App: check dongle result: " + firstLine);
+        if (result.StartsWith("OK"))
+        {
+            string msg = "USB BLE dongle is ready (driver installed and usable by the SDK).";
+            int colon = firstLine.IndexOf(':');
+            if (colon >= 0)
+                msg += "\nUsable dongle count: " + firstLine.Substring(colon + 1).Trim();
+            int nl = result.IndexOf('\n');
+            if (nl >= 0)
             {
-                result = _ctrl.CheckSetupDongle();
+                string extra = result.Substring(nl + 1).Trim();
+                if (extra.Length > 0)
+                    msg += "\n" + extra;
             }
-            catch (Exception ex)
-            {
-                result = "Error: " + ex.Message;
-            }
-            Post(() =>
-            {
-                _dongleChecking = false;
-                string firstLine = result.Split('\n')[0].Trim();
-                AppLog("App: check dongle result: " + firstLine);
-                if (result.StartsWith("OK"))
-                {
-                    string msg = "USB BLE dongle is ready (driver installed and usable by the SDK).";
-                    int colon = firstLine.IndexOf(':');
-                    if (colon >= 0)
-                        msg += "\nUsable dongle count: " + firstLine.Substring(colon + 1).Trim();
-                    int nl = result.IndexOf('\n');
-                    if (nl >= 0)
-                    {
-                        string extra = result.Substring(nl + 1).Trim();
-                        if (extra.Length > 0)
-                            msg += "\n" + extra;
-                    }
-                    ShowWarning("Check Setup Dongle", msg);
-                }
-                else
-                {
-                    ShowWarning("Check Setup Dongle", result);
-                }
-            });
-        }) { IsBackground = true, Name = "DongleCheck" };
-        t.Start();
+            ShowWarning("Check Setup Dongle", msg);
+        }
+        else
+        {
+            ShowWarning("Check Setup Dongle", result);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -2501,8 +2569,11 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
             infos.Add(info);
             macs.Add(info.Mac);
         }
+        var sensors = new List<SensorProfile>();
+        foreach (string mac in macs)
+            sensors.Add(_ctrl.RequireSensor(mac));
         SensorProfile[] profiles = _ctrl.MultiReplayBinFile(
-            paths.ToArray(), macs.ToArray(), true, ReplayDelegateTimeoutMs);
+            paths.ToArray(), sensors, true, ReplayDelegateTimeoutMs);
         r.Paths = paths;
         r.Infos = infos;
         r.Profiles = profiles;
@@ -2671,7 +2742,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         string csv = path.EndsWith(".bin", StringComparison.OrdinalIgnoreCase)
             ? path.Substring(0, path.Length - 4) + ".csv"
             : path + ".csv";
-        string result = await Task.Run(() => _ctrl.ParseBinToCsv(path, csv));
+        string result = await _ctrl.ParseBinToCsvAsync(path, csv);
         _analyzeRunning = false;
         if (result.StartsWith("Error"))
         {

@@ -142,6 +142,8 @@ namespace SensorSdk.Capi
         public int SupervisionTimeoutMs;
         [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
         public byte[] backend;
+        public byte GestChannelCount;
+        public ushort GestSampleRate;
 
         public static SenDeviceInfo Create()
         {
@@ -149,6 +151,23 @@ namespace SensorSdk.Capi
             info.structSize = (uint)Marshal.SizeOf<SenDeviceInfo>();
             return info;
         }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SenBinSensorDataConfig
+    {
+        public double sampleRate;
+        public double k;
+        public ulong channelMask;
+        public int dataType;
+        public byte typeIndex;
+        public byte channelCount;
+        public byte packageIndexLength;
+        public byte resolutionBits;
+        public byte resolutionSigned;
+        public sbyte rawDataBias;
+        public ushort packageSampleCount;
+        public ushort minPackageSampleCount;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -164,6 +183,19 @@ namespace SensorSdk.Capi
         [MarshalAs(UnmanagedType.ByValArray, SizeConst = 7)]
         public byte[] reserved;
         public SenDeviceInfo deviceInfo;
+        public uint ConfigVersion;
+        public int chipType;
+        public byte isUniversalStream;
+        public byte isNewEmg;
+        public byte isContainQat6;
+        public byte ppgModel;
+        public long featureMap;
+        public long notifyDataFlag;
+        public uint sensorDataCount;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 14)]
+        public SenBinSensorDataConfig[] sensorDatas;
+        public ulong firstDataTsMs;
+        public ulong lastDataTsMs;
 
         public static SenBinFileInfo Create()
         {
@@ -239,7 +271,7 @@ namespace SensorSdk.Capi
 #endif
         private const CallingConvention Cc = CallingConvention.Cdecl;
 
-        internal const uint ExpectedCapiVersion = 14;
+        internal const uint ExpectedCapiVersion = 20;
 
         [DllImport(Dll, CallingConvention = Cc)]
         internal static extern void sen_terminate();
@@ -269,6 +301,9 @@ namespace SensorSdk.Capi
         [DllImport(Dll, CallingConvention = Cc)]
         internal static extern int sen_controller_stop_scan(IntPtr ctrl);
 
+        [DllImport(Dll, CallingConvention = Cc)]
+        internal static extern void sen_controller_scan_once(IntPtr ctrl, int periodInMS, SenScanResultCb cb, IntPtr ctx);
+
         [DllImport(Dll, CallingConvention = Cc, CharSet = CharSet.Ansi)]
         internal static extern void sen_controller_log(
             IntPtr ctrl,
@@ -279,7 +314,8 @@ namespace SensorSdk.Capi
         internal static extern void sen_controller_on_suspend(IntPtr ctrl);
 
         [DllImport(Dll, CallingConvention = Cc)]
-        internal static extern int sen_check_setup_dongle(IntPtr buf, int outCap);
+        internal static extern void sen_controller_check_setup_dongle(
+            IntPtr ctrl, SenParamCb cb, IntPtr ctx);
 
         [DllImport(Dll, CallingConvention = Cc, CharSet = CharSet.Ansi)]
         internal static extern IntPtr sen_controller_require_sensor(
@@ -337,7 +373,7 @@ namespace SensorSdk.Capi
             IntPtr ctrl,
             [MarshalAs(UnmanagedType.LPStr)] string binPath,
             [MarshalAs(UnmanagedType.LPStr)] string csvPath,
-            IntPtr buf, UIntPtr len);
+            SenParamCb cb, IntPtr ctx);
 
         [DllImport(Dll, CallingConvention = Cc)]
         internal static extern void sen_controller_get_version(
@@ -346,13 +382,13 @@ namespace SensorSdk.Capi
         [DllImport(Dll, CallingConvention = Cc, CharSet = CharSet.Ansi)]
         internal static extern void sen_controller_get_param(
             IntPtr ctrl, [MarshalAs(UnmanagedType.LPStr)] string key,
-            IntPtr buf, UIntPtr len);
+            SenParamCb cb, IntPtr ctx);
 
         [DllImport(Dll, CallingConvention = Cc, CharSet = CharSet.Ansi)]
         internal static extern void sen_controller_set_param(
             IntPtr ctrl, [MarshalAs(UnmanagedType.LPStr)] string key,
             [MarshalAs(UnmanagedType.LPStr)] string value,
-            IntPtr buf, UIntPtr len);
+            SenParamCb cb, IntPtr ctx);
 
         [DllImport(Dll, CallingConvention = Cc)]
         internal static extern void sen_controller_multi_start_data(

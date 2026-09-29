@@ -174,6 +174,7 @@ public sealed partial class SensorDemoBehaviour
         GUILayout.Label("<b>Debug Log</b>", Rich());
         UiToggle("Enable SDK Debug Log", _debugLogEnabled, !replaying, OnDebugLogToggled);
         UiToggle("Enable Debug Bin Data", _binDataEnabled, !replaying, OnBinDataToggled);
+        UiToggle("Enable debug dongle", _dongleDebugEnabled, !replaying, OnDongleDebugToggled);
         GUILayout.EndVertical();
 
         GUILayout.BeginVertical("box", GUILayout.ExpandWidth(true));

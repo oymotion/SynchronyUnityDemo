@@ -113,6 +113,7 @@ namespace SensorSdk.ExampleUnity
         public readonly RingBuffer Eeg = new RingBuffer();
         public readonly RingBuffer Ecg = new RingBuffer();
         public readonly RingBuffer Brth = new RingBuffer();
+        public readonly RingBuffer MagAngle = new RingBuffer();
         public readonly RingBuffer Ppg = new RingBuffer();
         public readonly RingBuffer Spo2 = new RingBuffer();
         public readonly RingBuffer Quat = new RingBuffer();
@@ -138,8 +139,8 @@ namespace SensorSdk.ExampleUnity
         public readonly Dictionary<int, float> NominalRates = new Dictionary<int, float>();
         public readonly Dictionary<int, int> NominalChannels = new Dictionary<int, int>();
         public long RateWindowStartMs;
-        // Stream-start wall clock and first-packet delay
-        public double StreamStartTimeSec;
+        // Stream-start wall clock per data type and first-packet delay
+        public readonly Dictionary<int, double> StreamStartTimeSecs = new Dictionary<int, double>();
         public uint StreamDelayMs;
 
         public readonly Dictionary<string, int> LostCounts = new Dictionary<string, int>();
@@ -149,6 +150,7 @@ namespace SensorSdk.ExampleUnity
         // Cached switch states: key -> (enabled, checked)
         public Dictionary<string, Bool2> NtfStates = new Dictionary<string, Bool2>();
         public Dictionary<string, Bool2> FilterStates = new Dictionary<string, Bool2>();
+        public bool ImpedanceEnabled;
         // Cached sample-rate control state (group kind: 0 = EEG, 1 = EMG,
         // 2 = IMU, 3 = PPG)
         public List<int> SampleRateOptions = new List<int>();
@@ -199,7 +201,8 @@ namespace SensorSdk.ExampleUnity
                 return BioKind.PPG;
             if (Info.EEGChannelCount > 0 || Eeg.Allocated)
                 return BioKind.EEG;
-            if (Info.EMGChannelCount > 0 || Emg.Allocated)
+            if (Info.EMGChannelCount > 0 || Info.MagAngleChannelCount > 0
+                || Emg.Allocated || MagAngle.Allocated)
                 return BioKind.EMG;
             return BioKind.None;
         }
@@ -228,7 +231,7 @@ namespace SensorSdk.ExampleUnity
                 if (data.ChannelCount > 0)
                     NominalChannels[(int)data.DataType] = data.ChannelCount;
                 if (data.StartTimeSec > 0)
-                    StreamStartTimeSec = data.StartTimeSec;
+                    StreamStartTimeSecs[(int)data.DataType] = data.StartTimeSec;
                 if (data.Delay > 0)
                     StreamDelayMs = data.Delay;
             }
@@ -275,6 +278,8 @@ namespace SensorSdk.ExampleUnity
                     target = Ecg; impedance = EcgImpedance; seconds = BioBufferSeconds; break;
                 case SenDataType.Brth:
                     target = Brth; impedance = BrthImpedance; seconds = BioBufferSeconds; break;
+                case SenDataType.MagAngle:
+                    target = MagAngle; seconds = BioBufferSeconds; break;
             }
             if (target == null)
                 return;
@@ -352,6 +357,8 @@ namespace SensorSdk.ExampleUnity
                     if (data.SampleRate > 0)
                         NominalRates[(int)seg.Type] = data.SampleRate;
                     NominalChannels[(int)seg.Type] = seg.Count;
+                    if (data.StartTimeSec > 0)
+                        StreamStartTimeSecs[(int)seg.Type] = data.StartTimeSec;
                 }
 
                 RingBuffer target;
@@ -405,7 +412,7 @@ namespace SensorSdk.ExampleUnity
             lock (BufMutex)
             {
                 Acc.Clear(); Gyro.Clear(); Emg.Clear(); Eeg.Clear(); Ecg.Clear();
-                Brth.Clear(); Ppg.Clear(); Spo2.Clear(); Quat.Clear(); Euler.Clear();
+                Brth.Clear(); MagAngle.Clear(); Ppg.Clear(); Spo2.Clear(); Quat.Clear(); Euler.Clear();
                 Fill(EmgImpedance, -1.0f);
                 Fill(EegImpedance, -1.0f);
                 Fill(EcgImpedance, -1.0f);
@@ -451,6 +458,7 @@ namespace SensorSdk.ExampleUnity
             new TypeLabel((int)SenDataType.Ecg, "ECG"),
             new TypeLabel((int)SenDataType.Brth, "BRTH"),
             new TypeLabel((int)SenDataType.Gest, "GEST"),
+            new TypeLabel((int)SenDataType.MagAngle, "Angle"),
         };
 
         private readonly struct TypeLabel
@@ -491,13 +499,15 @@ namespace SensorSdk.ExampleUnity
                     if (!ActualRates.TryGetValue(tl.Type, out actual))
                         continue;
                     float nominal = GetOrDefault(NominalRates, tl.Type);
-                    entries.Add($"{tl.Label} {actual:F1} / {(nominal > 0 ? nominal.ToString() : "--")}Hz");
-                }
-                if (StreamStartTimeSec > 0)
-                {
-                    var dt = DateTimeOffset.FromUnixTimeMilliseconds((long)(StreamStartTimeSec * 1000.0))
-                                           .ToLocalTime();
-                    entries.Add("start " + dt.ToString("yyyy-MM-dd HH:mm:ss.fff"));
+                    string entry = $"{tl.Label} {actual:F1} / {(nominal > 0 ? nominal.ToString() : "--")}Hz";
+                    double startSec;
+                    if (StreamStartTimeSecs.TryGetValue(tl.Type, out startSec) && startSec > 0)
+                    {
+                        var dt = DateTimeOffset.FromUnixTimeMilliseconds((long)(startSec * 1000.0))
+                                               .ToLocalTime();
+                        entry += " (start " + dt.ToString("HH:mm:ss.fff") + ")";
+                    }
+                    entries.Add(entry);
                 }
                 if (StreamDelayMs > 0)
                     entries.Add($"delay {StreamDelayMs}ms");
@@ -516,12 +526,12 @@ namespace SensorSdk.ExampleUnity
                 case SenDataType.Quaternion: return "QUAT";
                 case SenDataType.Gest: return "GEST";
                 case SenDataType.Emg: return "EMG";
-                case SenDataType.MagAngle: return "MAG";
+                case SenDataType.MagAngle: return "Angle";
                 case SenDataType.Eeg: return "EEG";
                 case SenDataType.Ppg: return "PPG";
                 case SenDataType.Spo2: return "SPO2";
                 case SenDataType.Ecg: return "ECG";
-                case SenDataType.Impedance: return "IMP";
+                case SenDataType.Impedance: return "IMPE";
                 case SenDataType.Imu: return "IMU";
                 case SenDataType.Ads: return "ADS";
                 case SenDataType.Brth: return "BRTH";

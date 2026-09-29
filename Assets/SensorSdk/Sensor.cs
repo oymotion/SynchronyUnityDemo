@@ -1,9 +1,11 @@
 #nullable enable
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using AOT;
 using SensorSdk.Capi;
@@ -48,8 +50,66 @@ namespace SensorSdk
 
     internal static class CallbackGuard
     {
+        private static readonly ConcurrentDictionary<int, byte> SdkCallbackThreads = new();
+
         internal static void Log(Exception ex)
             => Console.Error.WriteLine("sensor callback threw: " + ex);
+
+        internal static void MarkSdkCallbackThread()
+            => SdkCallbackThreads.TryAdd(Environment.CurrentManagedThreadId, 0);
+
+        internal static void ThrowOnSdkCallbackThread()
+        {
+            if (SdkCallbackThreads.ContainsKey(Environment.CurrentManagedThreadId))
+                throw new InvalidOperationException(
+                    "blocking sync call from an SDK callback thread");
+        }
+    }
+
+    internal static class SyncWait
+    {
+        internal static bool Await(Task op, int backstopMs)
+        {
+            if (Task.WhenAny(op, Task.Delay(backstopMs)).GetAwaiter().GetResult() != op)
+                return false;
+            try
+            {
+                op.GetAwaiter().GetResult();
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        internal static T Await<T>(Task<T> op, int backstopMs, T timeoutValue)
+        {
+            if (Task.WhenAny(op, Task.Delay(backstopMs)).GetAwaiter().GetResult() != op)
+                return timeoutValue;
+            try
+            {
+                return op.GetAwaiter().GetResult();
+            }
+            catch
+            {
+                return timeoutValue;
+            }
+        }
+
+        internal static string AwaitString(Task<string> op, int backstopMs)
+        {
+            if (Task.WhenAny(op, Task.Delay(backstopMs)).GetAwaiter().GetResult() != op)
+                return "Error: Timeout";
+            try
+            {
+                return op.GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                return ex.Message;
+            }
+        }
     }
 
     public struct Sample
@@ -359,6 +419,8 @@ namespace SensorSdk
         public int PeripheralLatency;
         public int SupervisionTimeoutMs;
         public string Backend = string.Empty;
+        public byte GestChannelCount;
+        public ushort GestSampleRate;
 
         internal static DeviceInfo FromNative(in SenDeviceInfo i)
         {
@@ -405,7 +467,44 @@ namespace SensorSdk
                 ConnectionIntervalMs = i.ConnectionIntervalMs,
                 PeripheralLatency = i.PeripheralLatency,
                 SupervisionTimeoutMs = i.SupervisionTimeoutMs,
-                Backend = CapiString.FromBytes(i.backend)
+                Backend = CapiString.FromBytes(i.backend),
+                GestChannelCount = i.GestChannelCount,
+                GestSampleRate = i.GestSampleRate
+            };
+        }
+    }
+
+    public sealed class BinSensorDataConfig
+    {
+        public double SampleRate;
+        public double K;
+        public ulong ChannelMask;
+        public SenDataType DataType;
+        public byte TypeIndex;
+        public byte ChannelCount;
+        public byte PackageIndexLength;
+        public byte ResolutionBits;
+        public byte ResolutionSigned;
+        public sbyte RawDataBias;
+        public ushort PackageSampleCount;
+        public ushort MinPackageSampleCount;
+
+        internal static BinSensorDataConfig FromNative(in SenBinSensorDataConfig c)
+        {
+            return new BinSensorDataConfig
+            {
+                SampleRate = c.sampleRate,
+                K = c.k,
+                ChannelMask = c.channelMask,
+                DataType = (SenDataType)c.dataType,
+                TypeIndex = c.typeIndex,
+                ChannelCount = c.channelCount,
+                PackageIndexLength = c.packageIndexLength,
+                ResolutionBits = c.resolutionBits,
+                ResolutionSigned = c.resolutionSigned,
+                RawDataBias = c.rawDataBias,
+                PackageSampleCount = c.packageSampleCount,
+                MinPackageSampleCount = c.minPackageSampleCount
             };
         }
     }
@@ -417,17 +516,47 @@ namespace SensorSdk
         public double DurationSec;
         public bool Valid;
         public DeviceInfo DeviceInfo = new DeviceInfo();
+        public uint ConfigVersion;
+        public int ChipType;
+        public bool IsUniversalStream;
+        public bool IsNewEmg;
+        public bool IsContainQat6;
+        public byte PpgModel;
+        public long FeatureMap;
+        public long NotifyDataFlag;
+        public List<BinSensorDataConfig> SensorDatas = new List<BinSensorDataConfig>();
+        public ulong FirstDataTsMs;
+        public ulong LastDataTsMs;
 
         internal static BinFileInfo FromNative(in SenBinFileInfo i)
         {
-            return new BinFileInfo
+            var info = new BinFileInfo
             {
                 Mac = CapiString.FromBytes(i.mac),
                 DeviceName = CapiString.FromBytes(i.deviceName),
                 DurationSec = i.durationSec,
                 Valid = i.valid != 0,
-                DeviceInfo = SensorSdk.DeviceInfo.FromNative(in i.deviceInfo)
+                DeviceInfo = SensorSdk.DeviceInfo.FromNative(in i.deviceInfo),
+                ConfigVersion = i.ConfigVersion,
+                ChipType = i.chipType,
+                IsUniversalStream = i.isUniversalStream != 0,
+                IsNewEmg = i.isNewEmg != 0,
+                IsContainQat6 = i.isContainQat6 != 0,
+                PpgModel = i.ppgModel,
+                FeatureMap = i.featureMap,
+                NotifyDataFlag = i.notifyDataFlag,
+                FirstDataTsMs = i.firstDataTsMs,
+                LastDataTsMs = i.lastDataTsMs
             };
+            int count = (int)i.sensorDataCount;
+            SenBinSensorDataConfig[]? nativeDatas = i.sensorDatas;
+            if (nativeDatas != null)
+            {
+                if (count > nativeDatas.Length) count = nativeDatas.Length;
+                for (int n = 0; n < count; n++)
+                    info.SensorDatas.Add(BinSensorDataConfig.FromNative(in nativeDatas[n]));
+            }
+            return info;
         }
     }
 
@@ -435,6 +564,9 @@ namespace SensorSdk
     {
         internal IntPtr Handle { get; }
         private GCHandle _ctxHandle;
+        private DeviceInfo? _deviceInfoCache;
+        private BleDevice? _bleDeviceCache;
+        private int _powerCache = -1;
 
         public event Action<SensorProfile, List<SensorData>>? DataReceived;
         public event Action<SensorProfile, SenDeviceState>? StateChanged;
@@ -471,9 +603,11 @@ namespace SensorSdk
         {
             get
             {
+                if (_bleDeviceCache.HasValue) return _bleDeviceCache.Value;
                 var d = new SenBleDevice();
                 Native.sen_profile_get_device(Handle, ref d);
-                return BleDevice.FromNative(in d);
+                _bleDeviceCache = BleDevice.FromNative(in d);
+                return _bleDeviceCache.Value;
             }
         }
 
@@ -496,7 +630,7 @@ namespace SensorSdk
             return op.Task;
         }
 
-        public Task InitAsync(int packageSampleCount, int powerRefreshIntervalMs = 0, int timeoutMs = 10000)
+        public Task InitAsync(int packageSampleCount, int powerRefreshIntervalMs = 0, int timeoutMs = 0)
         {
             var op = new CompletionOp<string>();
             Native.sen_profile_init(Handle, packageSampleCount, timeoutMs,
@@ -504,53 +638,125 @@ namespace SensorSdk
             return op.Task;
         }
 
-        public Task StartDataNotificationAsync(int timeoutMs = 10000)
+        public Task StartDataNotificationAsync(int timeoutMs = 0)
         {
             var op = new CompletionOp<string>();
             Native.sen_profile_start_data(Handle, timeoutMs, NativeCallbacks.Completion, op.CtxPtr);
             return op.Task;
         }
 
-        public Task StopDataNotificationAsync(int timeoutMs = 10000)
+        public Task StopDataNotificationAsync(int timeoutMs = 0)
         {
             var op = new CompletionOp<string>();
             Native.sen_profile_stop_data(Handle, timeoutMs, NativeCallbacks.Completion, op.CtxPtr);
             return op.Task;
         }
 
-        public Task<int> GetBatteryLevelAsync(int timeoutMs = 10000)
+        public async Task<int> GetBatteryLevelAsync(int timeoutMs = 0)
         {
             var op = new CompletionOp<int>();
             Native.sen_profile_get_battery_level(Handle, timeoutMs, NativeCallbacks.Battery, op.CtxPtr);
-            return op.Task;
+            int level = await op.Task.ConfigureAwait(false);
+            if (level >= 0) _powerCache = level;
+            return level;
         }
 
-        public Task<DeviceInfo> FetchDeviceInfoAsync(int timeoutMs = 10000)
+        public async Task<DeviceInfo> FetchDeviceInfoAsync(int timeoutMs = 0)
         {
             var op = new CompletionOp<DeviceInfo>();
             Native.sen_profile_fetch_device_info(Handle, timeoutMs, NativeCallbacks.Info, op.CtxPtr);
-            return op.Task;
+            var info = await op.Task.ConfigureAwait(false);
+            _deviceInfoCache = info;
+            return info;
         }
 
-        public DeviceInfo GetDeviceInfo()
+        public DeviceInfo? GetDeviceInfo()
         {
+            if (_deviceInfoCache != null) return _deviceInfoCache;
             var info = SenDeviceInfo.Create();
             Native.sen_profile_get_device_info(Handle, ref info);
-            return DeviceInfo.FromNative(in info);
+            var outInfo = DeviceInfo.FromNative(in info);
+            if (outInfo.DeviceName.Length == 0 && outInfo.ModelName.Length == 0) return null;
+            _deviceInfoCache = outInfo;
+            return outInfo;
         }
 
-        public Task<string> SetParamAsync(string key, string value, int timeoutMs = 10000)
+        public Task<string> SetParamAsync(string key, string value, int timeoutMs = 0)
         {
             var op = new CompletionOp<string>();
             Native.sen_profile_set_param(Handle, timeoutMs, key, value, NativeCallbacks.Param, op.CtxPtr);
             return op.Task;
         }
 
-        public Task<string> GetParamAsync(string key, int timeoutMs = 10000)
+        public Task<string> GetParamAsync(string key, int timeoutMs = 0)
         {
             var op = new CompletionOp<string>();
             Native.sen_profile_get_param(Handle, timeoutMs, key, NativeCallbacks.Param, op.CtxPtr);
             return op.Task;
+        }
+
+        public bool Connect()
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.Await(ConnectAsync(), 40000, false);
+        }
+
+        public bool Disconnect()
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.Await(DisconnectAsync(), 25000, false);
+        }
+
+        public bool Init(int packageSampleCount, int powerRefreshIntervalMs = 0,
+            int timeoutMs = 0)
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.Await(
+                InitAsync(packageSampleCount, powerRefreshIntervalMs, timeoutMs),
+                (timeoutMs > 0 ? timeoutMs : SensorController.AssumedCmdTimeoutMs) + 15000);
+        }
+
+        public bool StartDataNotification(int timeoutMs = 0)
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.Await(StartDataNotificationAsync(timeoutMs),
+                (timeoutMs > 0 ? timeoutMs : SensorController.AssumedCmdTimeoutMs) + 15000);
+        }
+
+        public bool StopDataNotification(int timeoutMs = 0)
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.Await(StopDataNotificationAsync(timeoutMs),
+                (timeoutMs > 0 ? timeoutMs : SensorController.AssumedCmdTimeoutMs) + 15000);
+        }
+
+        public string SetParam(string key, string value, int timeoutMs = 0)
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.AwaitString(SetParamAsync(key, value, timeoutMs),
+                (timeoutMs > 0 ? timeoutMs : SensorController.AssumedCmdTimeoutMs) + 15000);
+        }
+
+        public string GetParam(string key, int timeoutMs = 0)
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.AwaitString(GetParamAsync(key, timeoutMs),
+                (timeoutMs > 0 ? timeoutMs : SensorController.AssumedCmdTimeoutMs) + 15000);
+        }
+
+        public int GetBatteryLevel()
+        {
+            if (_powerCache >= 0) return _powerCache;
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.Await(GetBatteryLevelAsync(),
+                SensorController.AssumedCmdTimeoutMs + 15000, -1);
+        }
+
+        public DeviceInfo? FetchDeviceInfo(int timeoutMs = 0)
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.Await<DeviceInfo>(FetchDeviceInfoAsync(timeoutMs),
+                (timeoutMs > 0 ? timeoutMs : SensorController.AssumedCmdTimeoutMs) + 15000, null!);
         }
 
         public void SetAutoReconnect(bool enabled)
@@ -595,6 +801,12 @@ namespace SensorSdk
 
         internal void RaiseState(int newState)
         {
+            if (newState == (int)SenDeviceState.Disconnected)
+            {
+                _deviceInfoCache = null;
+                _bleDeviceCache = null;
+                _powerCache = -1;
+            }
             var handler = StateChanged;
             if (handler == null) return;
             foreach (Action<SensorProfile, SenDeviceState> h in
@@ -631,6 +843,7 @@ namespace SensorSdk
 
         internal void RaisePower(int power)
         {
+            _powerCache = power;
             var handler = PowerChanged;
             if (handler == null) return;
             foreach (Action<SensorProfile, int> h in handler.GetInvocationList())
@@ -683,10 +896,12 @@ namespace SensorSdk
 
         internal void RaiseDeviceInfoUpdate(IntPtr info)
         {
-            var handler = DeviceInfoUpdated;
-            if (handler == null || info == IntPtr.Zero) return;
+            if (info == IntPtr.Zero) return;
             SenDeviceInfo native = Marshal.PtrToStructure<SenDeviceInfo>(info);
             var deviceInfo = DeviceInfo.FromNative(in native);
+            _deviceInfoCache = deviceInfo;
+            var handler = DeviceInfoUpdated;
+            if (handler == null) return;
             foreach (Action<SensorProfile, DeviceInfo> h in handler.GetInvocationList())
             {
                 try
@@ -728,6 +943,7 @@ namespace SensorSdk
         internal static readonly SenDeviceInfoUpdateCb DeviceInfoUpdate = OnDeviceInfoUpdate;
         internal static readonly SenDataTransferStateCb DataTransferState = OnDataTransferState;
         internal static readonly SenScanResultCb ScanResult = OnScanResult;
+        internal static readonly SenScanResultCb ScanOnceResult = OnScanOnceResult;
         internal static readonly SenEnableChangedCb EnableChanged = OnEnableChanged;
         internal static readonly SenCompletionCb Completion = OnCompletion;
         internal static readonly SenCompletionCb BoolCompletion = OnBoolCompletion;
@@ -742,6 +958,7 @@ namespace SensorSdk
         [MonoPInvokeCallback(typeof(SenDataCb))]
         private static void OnData(IntPtr ctx, IntPtr profile, IntPtr views, UIntPtr viewCount)
         {
+            CallbackGuard.MarkSdkCallbackThread();
             try
             {
                 ProfileFromCtx(ctx).RaiseData(views, checked((int)viewCount));
@@ -755,6 +972,7 @@ namespace SensorSdk
         [MonoPInvokeCallback(typeof(SenStateCb))]
         private static void OnState(IntPtr ctx, IntPtr profile, int newState)
         {
+            CallbackGuard.MarkSdkCallbackThread();
             try
             {
                 ProfileFromCtx(ctx).RaiseState(newState);
@@ -768,6 +986,7 @@ namespace SensorSdk
         [MonoPInvokeCallback(typeof(SenErrorCb))]
         private static void OnError(IntPtr ctx, IntPtr profile, IntPtr errorMsg)
         {
+            CallbackGuard.MarkSdkCallbackThread();
             try
             {
                 ProfileFromCtx(ctx).RaiseError(errorMsg);
@@ -781,6 +1000,7 @@ namespace SensorSdk
         [MonoPInvokeCallback(typeof(SenPowerCb))]
         private static void OnPower(IntPtr ctx, IntPtr profile, int power)
         {
+            CallbackGuard.MarkSdkCallbackThread();
             try
             {
                 ProfileFromCtx(ctx).RaisePower(power);
@@ -795,6 +1015,7 @@ namespace SensorSdk
         private static void OnAutoReconnect(IntPtr ctx, IntPtr profile, int hasLastSession,
                                             IntPtr answer, IntPtr answerCtx)
         {
+            CallbackGuard.MarkSdkCallbackThread();
             try
             {
                 ProfileFromCtx(ctx).RaiseAutoReconnect(hasLastSession, answer, answerCtx);
@@ -808,6 +1029,7 @@ namespace SensorSdk
         [MonoPInvokeCallback(typeof(SenDeviceInfoUpdateCb))]
         private static void OnDeviceInfoUpdate(IntPtr ctx, IntPtr profile, IntPtr info)
         {
+            CallbackGuard.MarkSdkCallbackThread();
             try
             {
                 ProfileFromCtx(ctx).RaiseDeviceInfoUpdate(info);
@@ -821,6 +1043,7 @@ namespace SensorSdk
         [MonoPInvokeCallback(typeof(SenDataTransferStateCb))]
         private static void OnDataTransferState(IntPtr ctx, IntPtr profile, int isTransferring)
         {
+            CallbackGuard.MarkSdkCallbackThread();
             try
             {
                 ProfileFromCtx(ctx).RaiseDataTransferState(isTransferring);
@@ -834,6 +1057,7 @@ namespace SensorSdk
         [MonoPInvokeCallback(typeof(SenScanResultCb))]
         private static void OnScanResult(IntPtr ctx, IntPtr devices, UIntPtr count)
         {
+            CallbackGuard.MarkSdkCallbackThread();
             try
             {
                 ((SensorController)GCHandle.FromIntPtr(ctx).Target!)
@@ -845,9 +1069,17 @@ namespace SensorSdk
             }
         }
 
+        [MonoPInvokeCallback(typeof(SenScanResultCb))]
+        private static void OnScanOnceResult(IntPtr ctx, IntPtr devices, UIntPtr count)
+        {
+            CallbackGuard.MarkSdkCallbackThread();
+            ScanOnceOp.Complete(ctx, devices, checked((int)count));
+        }
+
         [MonoPInvokeCallback(typeof(SenEnableChangedCb))]
         private static void OnEnableChanged(IntPtr ctx, int enabled)
         {
+            CallbackGuard.MarkSdkCallbackThread();
             try
             {
                 ((SensorController)GCHandle.FromIntPtr(ctx).Target!).RaiseEnableChanged(enabled != 0);
@@ -861,9 +1093,10 @@ namespace SensorSdk
         [MonoPInvokeCallback(typeof(SenCompletionCb))]
         private static void OnCompletion(IntPtr ctx, int result, IntPtr errorMsg)
         {
+            CallbackGuard.MarkSdkCallbackThread();
             try
             {
-                CompletionOp<string>.Complete(ctx, errorMsg, msg => msg);
+                CompletionOp<string>.Complete(ctx, result, errorMsg, msg => msg);
             }
             catch (Exception ex)
             {
@@ -874,6 +1107,7 @@ namespace SensorSdk
         [MonoPInvokeCallback(typeof(SenCompletionCb))]
         private static void OnBoolCompletion(IntPtr ctx, int result, IntPtr errorMsg)
         {
+            CallbackGuard.MarkSdkCallbackThread();
             try
             {
                 CompletionOp<bool>.Complete(ctx, errorMsg, _ => result != 0);
@@ -887,6 +1121,7 @@ namespace SensorSdk
         [MonoPInvokeCallback(typeof(SenParamCb))]
         private static void OnParam(IntPtr ctx, IntPtr result, IntPtr errorMsg)
         {
+            CallbackGuard.MarkSdkCallbackThread();
             try
             {
                 CompletionOp<string>.Complete(ctx, errorMsg,
@@ -901,6 +1136,7 @@ namespace SensorSdk
         [MonoPInvokeCallback(typeof(SenBatteryCb))]
         private static void OnBattery(IntPtr ctx, int result, IntPtr errorMsg)
         {
+            CallbackGuard.MarkSdkCallbackThread();
             try
             {
                 CompletionOp<int>.Complete(ctx, errorMsg, _ => result);
@@ -914,6 +1150,7 @@ namespace SensorSdk
         [MonoPInvokeCallback(typeof(SenInfoCb))]
         private static void OnInfo(IntPtr ctx, IntPtr info, IntPtr errorMsg)
         {
+            CallbackGuard.MarkSdkCallbackThread();
             try
             {
                 CompletionOp<DeviceInfo>.Complete(ctx, errorMsg, _ =>
@@ -932,6 +1169,7 @@ namespace SensorSdk
         private static void OnMultiResult(
             IntPtr ctx, IntPtr macs, IntPtr oks, IntPtr errors, UIntPtr count)
         {
+            CallbackGuard.MarkSdkCallbackThread();
             try
             {
                 MultiResultOp.Complete(ctx, macs, oks, errors, count);
@@ -955,13 +1193,60 @@ namespace SensorSdk
 
         internal static void Complete(IntPtr ctx, IntPtr errorMsg, Func<string, T> map)
         {
+            Complete(ctx, 1, errorMsg, map);
+        }
+
+        internal static void Complete(IntPtr ctx, int result, IntPtr errorMsg, Func<string, T> map)
+        {
             CompletionOp<T>? op = null;
             try
             {
                 op = (CompletionOp<T>)GCHandle.FromIntPtr(ctx).Target!;
                 string err = CapiString.FromPtr(errorMsg);
-                if (err.Length == 0) op._tcs.TrySetResult(map(err));
+                if (result != 0 && err.Length == 0) op._tcs.TrySetResult(map(err));
                 else op._tcs.TrySetException(new SensorException(err));
+            }
+            catch (Exception ex)
+            {
+                CallbackGuard.Log(ex);
+                if (op != null) op._tcs.TrySetException(ex);
+            }
+            finally
+            {
+                if (op != null && op._handle.IsAllocated) op._handle.Free();
+            }
+        }
+    }
+
+    internal sealed class ScanOnceOp
+    {
+        private readonly TaskCompletionSource<List<BleDevice>> _tcs =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly GCHandle _handle;
+
+        internal ScanOnceOp()
+        {
+            _handle = GCHandle.Alloc(this);
+        }
+
+        internal IntPtr CtxPtr => GCHandle.ToIntPtr(_handle);
+        internal Task<List<BleDevice>> Task => _tcs.Task;
+
+        internal static void Complete(IntPtr ctx, IntPtr devices, int count)
+        {
+            ScanOnceOp? op = null;
+            try
+            {
+                op = (ScanOnceOp)GCHandle.FromIntPtr(ctx).Target!;
+                var list = new List<BleDevice>(count);
+                int devSize = Marshal.SizeOf<SenBleDevice>();
+                for (int i = 0; i < count; i++)
+                {
+                    SenBleDevice d = Marshal.PtrToStructure<SenBleDevice>(
+                        IntPtr.Add(devices, i * devSize));
+                    list.Add(BleDevice.FromNative(in d));
+                }
+                op._tcs.TrySetResult(list);
             }
             catch (Exception ex)
             {
@@ -1033,6 +1318,8 @@ namespace SensorSdk
             new(() => new SensorController());
         public static SensorController Instance => _instance.Value;
 
+        internal static int AssumedCmdTimeoutMs = 10000;
+
         private readonly IntPtr _handle;
         private readonly GCHandle _ctxHandle;
         private readonly Dictionary<IntPtr, SensorProfile> _profiles = new();
@@ -1089,30 +1376,17 @@ namespace SensorSdk
 
         public async Task<List<BleDevice>> ScanAsync(int periodInMs)
         {
-            var found = new Dictionary<string, BleDevice>();
-            void Handler(List<BleDevice> devices)
-            {
-                lock (found)
-                {
-                    foreach (BleDevice d in devices)
-                        found[d.Mac] = d;
-                }
-            }
-            DeviceFound += Handler;
-            try
-            {
-                StartScan(periodInMs);
-                await Task.Delay(periodInMs).ConfigureAwait(false);
-                StopScan();
-            }
-            finally
-            {
-                DeviceFound -= Handler;
-            }
-            lock (found)
-            {
-                return new List<BleDevice>(found.Values);
-            }
+            var op = new ScanOnceOp();
+            Native.sen_controller_scan_once(_handle, periodInMs,
+                NativeCallbacks.ScanOnceResult, op.CtxPtr);
+            return await op.Task.ConfigureAwait(false);
+        }
+
+        public List<BleDevice> Scan(int periodInMs)
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.Await(ScanAsync(periodInMs), periodInMs + 15000,
+                new List<BleDevice>());
         }
 
         public void Log(string message, string level = "I")
@@ -1137,13 +1411,32 @@ namespace SensorSdk
             }
         }
 
-        public SensorProfile RequireSensor(BleDevice device) => RequireSensor(device.Mac);
+        public SensorProfile? RequireSensor(BleDevice device) => RequireSensor(device.Mac);
 
-        public SensorProfile RequireSensor(string mac)
+        public SensorProfile? RequireSensor(string mac)
         {
+            if (!IsValidMac(mac)) return null;
             IntPtr p = Native.sen_controller_require_sensor(_handle, mac);
             if (p == IntPtr.Zero) throw new SensorException("require_sensor failed");
             return WrapProfile(p);
+        }
+
+        private static bool IsValidMac(string mac)
+        {
+            if (mac == null || mac.Length != 17) return false;
+            for (int i = 0; i < mac.Length; i++)
+            {
+                char c = mac[i];
+                if ((i + 1) % 3 == 0)
+                {
+                    if (c != ':') return false;
+                }
+                else if (!Uri.IsHexDigit(c))
+                {
+                    return false;
+                }
+            }
+            return true;
         }
 
         public SensorProfile? GetSensor(string mac)
@@ -1186,7 +1479,7 @@ namespace SensorSdk
         }
 
         public Task<Dictionary<string, bool>> MultiStartDataNotificationAsync(
-            IReadOnlyList<SensorProfile> sensors, int timeoutMs = 30000,
+            IReadOnlyList<SensorProfile> sensors, int timeoutMs = 0,
             int maxDelayDispersionMs = 5, int maxAttempts = 3,
             Dictionary<string, string>? errors = null)
         {
@@ -1199,7 +1492,7 @@ namespace SensorSdk
         }
 
         public Task<Dictionary<string, bool>> MultiStopDataNotificationAsync(
-            IReadOnlyList<SensorProfile> sensors, int timeoutMs = 10000,
+            IReadOnlyList<SensorProfile> sensors, int timeoutMs = 0,
             Dictionary<string, string>? errors = null)
         {
             IntPtr[] handles = CollectHandles(sensors);
@@ -1208,6 +1501,28 @@ namespace SensorSdk
                 (UIntPtr)handles.Length, timeoutMs, NativeCallbacks.MultiResult,
                 op.CtxPtr);
             return op.Task;
+        }
+
+        public Dictionary<string, bool> MultiStartDataNotification(
+            IReadOnlyList<SensorProfile> sensors, int timeoutMs = 0,
+            int maxDelayDispersionMs = 5, int maxAttempts = 3,
+            Dictionary<string, string>? errors = null)
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.Await(
+                MultiStartDataNotificationAsync(sensors, timeoutMs,
+                    maxDelayDispersionMs, maxAttempts, errors),
+                (timeoutMs > 0 ? timeoutMs : 60000) + 45000, new Dictionary<string, bool>());
+        }
+
+        public Dictionary<string, bool> MultiStopDataNotification(
+            IReadOnlyList<SensorProfile> sensors, int timeoutMs = 0,
+            Dictionary<string, string>? errors = null)
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.Await(
+                MultiStopDataNotificationAsync(sensors, timeoutMs, errors),
+                timeoutMs + 45000, new Dictionary<string, bool>());
         }
 
         private static IntPtr[] CollectHandles(IReadOnlyList<SensorProfile> sensors)
@@ -1232,20 +1547,29 @@ namespace SensorSdk
         }
 
         public SensorProfile? ReplayBinFile(string path, string deviceMac,
-            bool realtime = true, uint timeoutMs = 30000)
+            bool realtime = true, uint timeoutMs = 0)
         {
             IntPtr p = Native.sen_controller_replay_bin_file(
                 _handle, path, deviceMac ?? string.Empty, realtime ? 1 : 0, timeoutMs);
             return p == IntPtr.Zero ? null : WrapProfile(p);
         }
 
-        public SensorProfile?[] MultiReplayBinFile(string[] paths, string[] macs,
-            bool realtime = true, uint timeoutMs = 30000)
+        public SensorProfile?[] MultiReplayBinFile(string[] paths,
+            IReadOnlyList<SensorProfile> sensors,
+            bool realtime = true, uint timeoutMs = 0)
         {
             if (paths == null) throw new ArgumentNullException(nameof(paths));
-            if (macs == null) throw new ArgumentNullException(nameof(macs));
-            if (paths.Length != macs.Length)
-                throw new ArgumentException("paths and macs must have the same length");
+            if (sensors == null) throw new ArgumentNullException(nameof(sensors));
+            if (paths.Length != sensors.Count)
+                throw new ArgumentException("paths and sensors must have the same length");
+            var macs = new string[paths.Length];
+            for (int i = 0; i < paths.Length; i++)
+            {
+                if (sensors[i] == null)
+                    throw new ArgumentException(
+                        "sensors must not contain null entries", nameof(sensors));
+                macs[i] = sensors[i].Device.Mac;
+            }
             var outProfiles = new IntPtr[paths.Length];
             Native.sen_controller_multi_replay_bin_file(
                 _handle, paths, macs, (UIntPtr)paths.Length,
@@ -1277,12 +1601,22 @@ namespace SensorSdk
                 return true;
             });
 
-        public string ParseBinToCsv(string binPath, string csvPath)
-            => CapiString.ReadOutString((buf, len) =>
-            {
-                Native.sen_controller_parse_bin_to_csv(_handle, binPath, csvPath, buf, len);
-                return true;
-            });
+        public Task<string> ParseBinToCsvAsync(string binPath, string csvPath)
+        {
+            var op = new CompletionOp<string>();
+            Native.sen_controller_parse_bin_to_csv(_handle, binPath, csvPath,
+                NativeCallbacks.Param, op.CtxPtr);
+            return op.Task;
+        }
+
+        public string ParseBinToCsv(string binPath, string? csvPath = null)
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            string csv = string.IsNullOrEmpty(csvPath)
+                ? System.IO.Path.ChangeExtension(binPath, ".csv")
+                : csvPath!;
+            return SyncWait.AwaitString(ParseBinToCsvAsync(binPath, csv), 320000);
+        }
 
         public string GetVersion()
             => CapiString.ReadOutString((buf, len) =>
@@ -1291,26 +1625,51 @@ namespace SensorSdk
                 return true;
             }, capacity: 256);
 
-        public string GetParam(string key)
-            => CapiString.ReadOutString((buf, len) =>
+        public Task<string> GetParamAsync(string key)
+        {
+            var op = new CompletionOp<string>();
+            Native.sen_controller_get_param(_handle, key, NativeCallbacks.Param, op.CtxPtr);
+            return op.Task;
+        }
+
+        public async Task<string> SetParamAsync(string key, string value)
+        {
+            var op = new CompletionOp<string>();
+            Native.sen_controller_set_param(_handle, key, value,
+                NativeCallbacks.Param, op.CtxPtr);
+            string result = await op.Task.ConfigureAwait(false);
+            if (key == "CMD_TIMEOUT_MS" && result == "OK" &&
+                int.TryParse(value, out int ms) && ms > 0)
             {
-                Native.sen_controller_get_param(_handle, key, buf, len);
-                return true;
-            }, capacity: 256);
+                AssumedCmdTimeoutMs = ms;
+            }
+            return result;
+        }
+
+        public Task<string> CheckSetupDongleAsync()
+        {
+            var op = new CompletionOp<string>();
+            Native.sen_controller_check_setup_dongle(_handle, NativeCallbacks.Param, op.CtxPtr);
+            return op.Task;
+        }
+
+        public string GetParam(string key)
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.AwaitString(GetParamAsync(key), 20000);
+        }
 
         public string SetParam(string key, string value)
-            => CapiString.ReadOutString((buf, len) =>
-            {
-                Native.sen_controller_set_param(_handle, key, value, buf, len);
-                return true;
-            }, capacity: 256);
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.AwaitString(SetParamAsync(key, value), 20000);
+        }
 
         public string CheckSetupDongle()
-            => CapiString.ReadOutString((buf, len) =>
-            {
-                Native.sen_check_setup_dongle(buf, (int)len.ToUInt32());
-                return true;
-            }, capacity: 256);
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.AwaitString(CheckSetupDongleAsync(), 320000);
+        }
 
         public static uint CapiVersion => Native.sen_capi_version();
 
