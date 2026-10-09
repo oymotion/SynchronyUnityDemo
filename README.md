@@ -16,8 +16,8 @@ demo's own version (bump +0.0.1 per demo change).
 
 Unity 2021.3+ (.NET Standard 2.1 API compatibility level — the default).
 Targets Windows (x86_64 / x86), Android (arm64-v8a / x86 / x86_64), iOS,
-macOS and Linux (x86_64 / x86) players; Mono editor and IL2CPP standalone
-builds both work.
+macOS and Linux (x86_64 / x86 / arm64) players; Mono editor and IL2CPP
+standalone builds both work.
 
 ## Setup
 
@@ -39,11 +39,13 @@ This repository **is** the Unity project, with everything pre-installed:
 - `Assets/Plugins/Linux/x86_64/libsensor.so` and
   `Assets/Plugins/Linux/x86/libsensor.so` — the Linux runtimes (64-bit /
   32-bit)
+- `Assets/Plugins/Linux/arm64/libsensor.so` — the Linux ARM64 runtime
 
 Just open the project with Unity **2021.3+** (.NET Standard 2.1 API
 compatibility level — the default) and press **Play**. SDK file logs land
 in `%USERPROFILE%\Documents\sensorsdklog\<yyyyMMdd_HHmmss>_<sdk version>`
-(the demo sets the path via `SetLogPath` before `SetDebugEnabled(true)`).
+(the demo sets the path via the `LOG_PATH` controller parameter before
+enabling `DEBUG_ENABLED`).
 ## 1. Permission
 
 - **Windows / Linux editor and players**: no capability declaration or
@@ -302,7 +304,7 @@ DeviceInfo deviceInfo = sensorProfile.GetDeviceInfo();
 
 // fields: DeviceName, ModelName, HardwareVersion, FirmwareVersion, MTUSize
 // plus a ChannelCount / SampleRate field pair per modality:
-//   Ppg, Spo2, Impe, Emg, Eeg, Ecg, Acc, Gyro, Brth, MagAngle, Euler, Quat
+//   Ppg, Spo2, Impe, EMG, EEG, ECG, Acc, Gyro, BRTH, MagAngle, Euler, Quat
 // plus EmgMaxSampleRate / EegMaxSampleRate / EcgMaxSampleRate (maximum rate
 //   from the capability query, 0 = not reported)
 // plus ImuChannelCount / ImuSampleRate (aggregated IMU stream; 0 = none)
@@ -435,7 +437,8 @@ bool isTransfering = sensorProfile.IsDataTransfering;
 
 ```csharp
 int batteryPower = await sensorProfile.GetBatteryLevelAsync();
-// 0-100; -1 means no valid reading is available yet
+// 0-100; a failure throws SensorException. The sync GetBatteryLevel()
+// answers the cached reading instead, -1 when none is available
 // (PowerChanged never reports -1). Explicit queries are unfiltered.
 ```
 
@@ -443,7 +446,7 @@ int batteryPower = await sensorProfile.GetBatteryLevelAsync();
 
 All profile operations are Task-returning async methods backed by the SDK's
 completion callbacks; a non-empty SDK error string becomes a
-`SensorException`. There are no synchronous blocking variants:
+`SensorException`:
 
 - `SensorController`: `ScanAsync`
 - `SensorProfile`: `ConnectAsync`, `DisconnectAsync`, `InitAsync`,
@@ -451,14 +454,28 @@ completion callbacks; a non-empty SDK error string becomes a
   `SetParamAsync`, `GetParamAsync`, `GetBatteryLevelAsync`,
   `FetchDeviceInfoAsync`
 
+Every async op also has a blocking synchronous form that waits on the same
+operation with a backstop timeout: profile `Connect()` / `Disconnect()` /
+`Init(...)` / `StartDataNotification()` / `StopDataNotification()` /
+`SetParam(...)` / `GetParam(...)` / `GetBatteryLevel()` /
+`FetchDeviceInfo()`, and controller `Scan(...)` /
+`MultiStartDataNotification(...)` / `MultiStopDataNotification(...)` /
+`ParseBinToCsv(...)` / `GetParam(...)` / `SetParam(...)` /
+`CheckSetupDongle()`. A sync form throws `InvalidOperationException` when
+called from an SDK callback thread — use the async forms inside event
+handlers.
+
 ### setParam method
 
 Use `Task<string> SetParamAsync(string key, string value)` to set a
-parameter. Call after the device reaches the `Ready` state; the result is
-`"OK"` on success or an error string otherwise. If the device is already
-streaming when you change an `NTF_*` key, the SDK stops and restarts the data
-notification so the new setting takes effect immediately. `FILTER_*` keys are
-applied on the fly without interrupting the stream.
+parameter. Call after the device reaches the `Ready` state. The result is
+`"OK"` on success, a command-outcome `"ERROR: ..."` string when the device
+rejects the change, or `"Error: Not supported"` for an unknown key; guard
+failures (device not `Ready`, not initialized, a replay profile, or a
+previous setParam still in flight) throw `SensorException`. If the device is
+already streaming when you change an `NTF_*` key, the SDK stops and restarts
+the data notification so the new setting takes effect immediately. `FILTER_*`
+keys are applied on the fly without interrupting the stream.
 
 ```csharp
 // Data stream toggles ("ON" / "OFF")
@@ -473,14 +490,8 @@ await sensorProfile.SetParamAsync("NTF_MAG_ANGLE", "ON");
 await sensorProfile.SetParamAsync("NTF_PPG", "ON");
 await sensorProfile.SetParamAsync("NTF_PPG_RAW", "ON");   // alias of NTF_PPG
 await sensorProfile.SetParamAsync("NTF_SPO2", "ON");
-await sensorProfile.SetParamAsync("NTF_GFORCE_EULER", "ON");
-await sensorProfile.SetParamAsync("NTF_GFORCE_QUAT", "ON");
-await sensorProfile.SetParamAsync("NTF_GFORCE_ACC", "ON");
-await sensorProfile.SetParamAsync("NTF_GFORCE_GYRO", "ON");
-// NTF_IMU is the master switch of the four NTF_GFORCE_* streams: toggling it
-// updates all four, and toggling any of the four updates the aggregated
-// NTF_IMU state. On legacy EMG devices NTF_GEST and NTF_EMG are mutually
-// exclusive.
+// NTF_IMU switches all four IMU streams (ACC/GYRO/EULER/QUAT) together.
+// On legacy EMG devices NTF_GEST and NTF_EMG are mutually exclusive.
 
 // Firmware filter toggles
 await sensorProfile.SetParamAsync("FILTER_50HZ", "ON");   // 50Hz notch
@@ -502,7 +513,8 @@ await sensorProfile.SetParamAsync("NEUCIR_APP_CONTROL", "OPEN");   // OPEN / CLO
 await sensorProfile.SetParamAsync("DEBUG_BLE_DATA_PATH", "True");
 // export the session's raw BLE capture: "True" exports
 // {DeviceName}_data_YYYYMMDD_HHMMSS.bin into the SDK log directory (see
-// SetLogPath), or pass an absolute .bin path; "False" / "" disables export.
+// the LOG_PATH controller parameter), or pass an absolute .bin path;
+// "False" / "" disables export.
 await sensorProfile.SetParamAsync("DEBUG_LOG_PATH", "True");
 // enable this profile's log file ({DeviceName}_log_YYYYMMDD_HHMMSS.txt in
 // the SDK log directory), or pass an absolute path; "False" / "" disables.
@@ -579,9 +591,10 @@ stopping stays per device:
 ```csharp
 SensorProfile[] replays = controller.MultiReplayBinFile(
     new[] { "d:/temp/dev1.bin", "d:/temp/dev2.bin" },
-    new[] { "AA:BB:CC:DD:EE:01", "AA:BB:CC:DD:EE:02" });
-// Input-order aligned; a null entry marks a member that failed
-// (bad/duplicate mac, mac busy, unreadable file).
+    new[] { controller.RequireSensor("AA:BB:CC:DD:EE:01"),
+            controller.RequireSensor("AA:BB:CC:DD:EE:02") });
+// The returned array is input-order aligned; a null entry marks a member
+// that failed (bad/duplicate mac, mac busy, unreadable file).
 ```
 
 Each started profile delivers data through the same callbacks as a single
@@ -616,21 +629,21 @@ without a config record yields `raw` rows only.
 
 ## Logging controls
 
-`SetLogPath` sets the SDK log **directory** (it must be a directory). All
-default file outputs live in it: the controller log, the default per-profile
-logs (`DEBUG_LOG_PATH=True`) and the default bin exports
-(`DEBUG_BLE_DATA_PATH=True`).
+The `LOG_PATH` controller parameter sets the SDK log **directory** (it must
+be a directory). All default file outputs live in it: the controller log,
+the default per-profile logs (`DEBUG_LOG_PATH=True`) and the default bin
+exports (`DEBUG_BLE_DATA_PATH=True`).
 
 ```csharp
-controller.SetDebugEnabled(true);
+await controller.SetParamAsync("LOG_PATH", "d:/temp/sdklogs");
+// set the log directory (created if missing) — set it BEFORE enabling
+// DEBUG_ENABLED so the session's logs land in one place. "False" disables
+// file output; "True" resets to the default (Documents/sensorsdklog).
+
+await controller.SetParamAsync("DEBUG_ENABLED", "True");
 // enable SDK debug logs; creates the controller log
 // (sensor_controller_log_YYYYMMDD_HHMMSS.txt) in the log directory.
-// SetDebugEnabled(false) closes it and drops all file output.
-
-controller.SetLogPath(true, "d:/temp/sdklogs");
-// set the log directory (created if missing). SetLogPath(false) disables
-// file output; SetLogPath(true) resets to the default
-// (Documents/sensorsdklog).
+// "False" closes it and drops all file output.
 ```
 
 ### Application log entries
@@ -645,7 +658,7 @@ sensorProfile.Log("User toggled filter 50Hz", "I"); // profile log when enabled,
 ```
 
 `level` is judged by its first character, case-insensitive `d` / `i` / `w` /
-`e` (anything else is `Info`); `d` follows the `SetDebugEnabled` switch.
+`e` (anything else is `Info`); `d` follows the `DEBUG_ENABLED` switch.
 Entries are tagged `[App]` in the log files. Never throws. This demo routes
 key UI events (scan start/stop, connect lifecycle, setParam results, live
 filter switch, replay start/pause/resume/stop/EOF, bin analyze, toggles,
@@ -732,8 +745,9 @@ feeds the per-device display rings; views repaint at most once per 50 ms).
   must be installed for the Editor post-processor script to compile.
 - **macOS**: copy a Mac-built `libsensor.dylib` into `Assets/Plugins/OSX/`
   (the setup script does this when the file exists).
-- **Linux**: the plugin is the WSL-built `libsensor_x86.so` renamed to
-  `libsensor.so`; it links glib-2.0/gio-2.0 dynamically, so the target
+- **Linux**: the x86_64/x86 plugin is the WSL-built `libsensor_x86.so`
+  renamed to `libsensor.so`, the arm64 one is the docker-built
+  `libsensor_arm64.so`; it links glib-2.0/gio-2.0 dynamically, so the target
   machine needs the standard glib runtime (preinstalled on desktop Linux).
 - **Editor hangs entering Play mode**: on some machines Unity 2021.3
   deadlocks while entering Play (the log stops at "Setting up N worker
