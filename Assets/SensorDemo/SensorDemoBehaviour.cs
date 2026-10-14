@@ -36,7 +36,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     private const int CmdTimeoutMs = 5000;
     private const int PlotUpdateIntervalMs = 50;
     private const int FftUpdateIntervalMs = 200;
-    private const string DemoVersion = "0.1.25";
+    private const string DemoVersion = "0.1.28";
     private const int PowerRefreshPeriodMs = 60000;
     private const int PowerStableBand = 4;
     private const uint ReplayDelegateTimeoutMs = 5000;
@@ -125,6 +125,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     private bool _debugLogEnabled = true;
     private bool _binDataEnabled = true;
     private bool _dongleDebugEnabled = true;
+    private bool _translateImu = true;
     private bool _autoReconnect = true;
     private bool _dongleChecking;
 
@@ -751,7 +752,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
 
         SensorProfile profile = _ctrl.RequireSensor(mac);
         HookProfileEvents(profile);
-        profile.SetAutoReconnect(_autoReconnect);
+        profile.AutoReconnect = _autoReconnect;
 
         var st = new DeviceState(profile) { Name = name };
         st.LiveFilterState.SetBand(_filterBand);
@@ -1424,6 +1425,15 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         ApplyDongleDebug();
     }
 
+    private async void OnTranslateImuToggled(bool enabled)
+    {
+        _translateImu = enabled;
+        string value = enabled ? "True" : "False";
+        AppLog($"User: translate IMU {(enabled ? "ON" : "OFF")}");
+        string result = await _ctrl.SetParamAsync("TRANSLATE_IMU", value);
+        AppLog($"App: setParam(TRANSLATE_IMU, {value}) -> {result}");
+    }
+
     private async Task PushDebugPathParam(DeviceState st, string key, string value)
     {
         string msg = await SendSetParam(st.Profile, key, value);
@@ -1500,7 +1510,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         _autoReconnect = enabled;
         AppLog($"User: auto reconnect {(enabled ? "ON" : "OFF")}");
         foreach (DeviceState st in SnapshotStates())
-            st.Profile.SetAutoReconnect(enabled);
+            st.Profile.AutoReconnect = enabled;
     }
 
     // ------------------------------------------------------------------

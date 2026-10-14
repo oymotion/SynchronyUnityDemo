@@ -175,6 +175,7 @@ public sealed partial class SensorDemoBehaviour
         UiToggle("Enable SDK Debug Log", _debugLogEnabled, !replaying, OnDebugLogToggled);
         UiToggle("Enable Debug Bin Data", _binDataEnabled, !replaying, OnBinDataToggled);
         UiToggle("Enable debug dongle", _dongleDebugEnabled, !replaying, OnDongleDebugToggled);
+        UiToggle("Translate IMU (split ACC/GYRO/EULER/QUAT)", _translateImu, !replaying, OnTranslateImuToggled);
         GUILayout.EndVertical();
 
         GUILayout.BeginVertical("box", GUILayout.ExpandWidth(true));
