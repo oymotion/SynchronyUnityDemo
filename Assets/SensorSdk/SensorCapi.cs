@@ -17,11 +17,12 @@ namespace SensorSdk.Capi
     {
         Acc = 1,
         Gyro = 2,
+        Mag = 3,
         Euler = 4,
         Quaternion = 5,
         Gest = 7,
         Emg = 8,
-        MagAngle = 13,
+        Angle = 13,
         Eeg = 16,
         Ecg = 17,
         Impedance = 18,
@@ -114,14 +115,14 @@ namespace SensorSdk.Capi
         public byte BRTHChannelCount;
         public byte AccChannelCount;
         public byte GyroChannelCount;
-        public byte MagAngleChannelCount;
+        public byte AngleChannelCount;
         public ushort EMGSampleRate;
         public ushort EEGSampleRate;
         public ushort ECGSampleRate;
         public ushort BRTHSampleRate;
         public ushort AccSampleRate;
         public ushort GyroSampleRate;
-        public ushort MagAngleSampleRate;
+        public ushort AngleSampleRate;
         public byte ImuChannelCount;
         public ushort ImuSampleRate;
         public byte EulerChannelCount;
@@ -144,6 +145,8 @@ namespace SensorSdk.Capi
         public byte[] backend;
         public byte GestChannelCount;
         public ushort GestSampleRate;
+        public byte MagChannelCount;
+        public ushort MagSampleRate;
 
         public static SenDeviceInfo Create()
         {
@@ -271,7 +274,7 @@ namespace SensorSdk.Capi
 #endif
         private const CallingConvention Cc = CallingConvention.Cdecl;
 
-        internal const uint ExpectedCapiVersion = 21;
+        internal const uint ExpectedCapiVersion = 22;
 
         [DllImport(Dll, CallingConvention = Cc)]
         internal static extern void sen_terminate();

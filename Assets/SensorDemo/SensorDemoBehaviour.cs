@@ -36,12 +36,12 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     private const int CmdTimeoutMs = 5000;
     private const int PlotUpdateIntervalMs = 50;
     private const int FftUpdateIntervalMs = 200;
-    private const string DemoVersion = "0.1.28";
+    private const string DemoVersion = "0.1.39";
     private const int PowerRefreshPeriodMs = 60000;
     private const int PowerStableBand = 4;
     private const uint ReplayDelegateTimeoutMs = 5000;
 
-    private static readonly string[] NtfKeys = { "NTF_EEG", "NTF_IMPEDANCE", "NTF_EMG", "NTF_GEST", "NTF_PPG", "NTF_SPO2", "NTF_IMU", "NTF_MAG_ANGLE" };
+    private static readonly string[] NtfKeys = { "NTF_EEG", "NTF_IMPEDANCE", "NTF_EMG", "NTF_GEST", "NTF_PPG", "NTF_SPO2", "NTF_IMU", "NTF_ANGLE" };
     private static readonly string[] FilterKeys = { "FILTER_50HZ", "FILTER_60HZ", "FILTER_HPF", "FILTER_LPF" };
     // Sample-rate groups: 0 = EEG, 1 = EMG, 2 = IMU, 3 = PPG
     private const int SampleRateGroupCount = 4;
@@ -60,7 +60,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     {
         ["NTF_EEG"] = "EEG", ["NTF_IMPEDANCE"] = "IMPE", ["NTF_EMG"] = "EMG", ["NTF_GEST"] = "GESTURE",
         ["NTF_PPG"] = "PPG", ["NTF_SPO2"] = "SpO2", ["NTF_IMU"] = "IMU",
-        ["NTF_MAG_ANGLE"] = "Angle",
+        ["NTF_ANGLE"] = "Angle",
     };
     private static readonly Dictionary<string, string> FilterLabels = new Dictionary<string, string>
     {
@@ -71,6 +71,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     private static readonly string[] TypeLabels =
     {
         "Acceleration (ACC)", "Gyroscope (GYRO)", "Quaternion (Quat)", "Euler Angle (Euler)",
+        "Magnetometer (MAG)",
     };
 
     private SensorController _ctrl;
@@ -278,8 +279,8 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         _dataWorker.Start();
 
         if (_debugLogEnabled)
-            ApplySdkDebugLog();
-        ApplyDongleDebug();
+            _ = ApplySdkDebugLog();
+        _ = ApplyDongleDebug();
 
         PlatformInit();
 
@@ -523,7 +524,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         MaybeSubmitBioFft(st);
 
         bool bioReady = st != null && ((st.GetBioKind() == DeviceState.BioKind.EMG
-                                        && (st.Emg.Allocated || st.MagAngle.Allocated))
+                                        && (st.Emg.Allocated || st.Angle.Allocated))
                                        || (st.GetBioKind() == DeviceState.BioKind.EEG && st.Eeg.Allocated)
                                        || (st.GetBioKind() == DeviceState.BioKind.PPG && st.Ppg.Allocated));
         if (bioReady && _bioWaves.Count > 0 && !_bioWaves[0].HasSource)
@@ -719,7 +720,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     // Connect chain
     // ------------------------------------------------------------------
 
-    private void UiConnectSelected()
+    private async void UiConnectSelected()
     {
         if (_replayStarting)
             return;
@@ -740,10 +741,10 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
             _ctrl.StopScan();
             _scanning = false;
         }
-        ConnectDevice(mac);
+        await ConnectDevice(mac);
     }
 
-    private async void ConnectDevice(string mac)
+    private async Task ConnectDevice(string mac)
     {
         string name = mac;
         foreach (DeviceEntry d in _discovered)
@@ -780,13 +781,22 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         profile.OnAutoReconnect = (p, hasLastSession, answer) =>
         {
             p.Log("App: auto reconnect callback received, restore=" + (hasLastSession ? "True" : "False"));
-            Post(() => RecoverDevice(mac, hasLastSession));
+            if (!_autoReconnect || !p.AutoReconnect)
+            {
+                p.AutoReconnect = false;
+                answer(false);
+                return;
+            }
+            Post(async () => await RecoverDevice(mac, hasLastSession));
             answer(true);
         };
     }
 
-    private async void RecoverDevice(string mac, bool restore)
+    private async Task RecoverDevice(string mac, bool restore)
     {
+        SensorProfile profile = _ctrl.GetSensor(mac);
+        if (profile == null)
+            return;
         // App-driven recovery: re-select the row and re-run the connect
         // chain; the recorded setParam history replays after the stream
         // start.
@@ -795,11 +805,6 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
             if (_deviceStates.ContainsKey(mac))
                 return;
         }
-        SensorProfile profile = _ctrl.GetSensor(mac);
-        if (profile == null)
-            return;
-        if (restore)
-            _restoreParamsMacs.Add(mac);
         string name = mac;
         foreach (DeviceEntry d in _discovered)
             if (d.Mac == mac) { name = d.Name; break; }
@@ -807,17 +812,41 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         st.LiveFilterState.SetBand(_filterBand);
         lock (_statesMutex)
             _deviceStates[mac] = st;
+        if (AutoRecoveryCancelled(st, true))
+            return;
+        if (restore)
+            _restoreParamsMacs.Add(mac);
         _currentMac = mac;
         _selectedMac = mac;
         RetargetWaveforms();
         RefreshInfoPanel();
-        await RunConnectChain(st);
+        await RunConnectChain(st, true);
     }
 
-    private async Task RunConnectChain(DeviceState st)
+    private bool AutoRecoveryCancelled(DeviceState st, bool isAutoRecovery)
+    {
+        if (!isAutoRecovery || (_autoReconnect && st.Profile.AutoReconnect))
+            return false;
+        st.Profile.AutoReconnect = false;
+        if (st.Profile.DeviceState == SenDeviceState.Disconnected)
+        {
+            OnStateChanged(st.Mac, SenDeviceState.Disconnected);
+            return true;
+        }
+        if (st.Profile.IsDataTransfering)
+            _streamingMacs.Add(st.Mac);
+        else
+            _streamingMacs.Remove(st.Mac);
+        UpdateDeviceItemText(st.Mac, true);
+        return true;
+    }
+
+    private async Task RunConnectChain(DeviceState st, bool isAutoRecovery = false)
     {
         try
         {
+            if (AutoRecoveryCancelled(st, isAutoRecovery))
+                return;
             if (!st.Profile.IsReady)
             {
                 bool ok = await st.Profile.ConnectAsync();
@@ -867,11 +896,11 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
             st.FlowStarted = true;
             AppLog($"App: device connected and streaming: {st.Name} ({st.Mac})", "I", st);
             UpdateDeviceItemText(st.Mac, true);
-            await ApplySessionParams(st);
+            await ApplySessionParams(st, isAutoRecovery);
             if (_restoreParamsMacs.Remove(st.Mac))
-                await RestoreSavedParams(st);
+                await RestoreSavedParams(st, isAutoRecovery);
             else
-                RefreshControlStates(st);
+                await RefreshControlStates(st);
             if (_currentMac == st.Mac)
             {
                 RefreshInfoPanel();
@@ -899,7 +928,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         }
     }
 
-    private void UiDisconnectCurrent()
+    private async void UiDisconnectCurrent()
     {
         DeviceState st = CurrentState();
         if (st == null || st.IsReplay)
@@ -912,7 +941,15 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
             return;
         }
         _statusText = "Disconnecting...";
-        _ = st.Profile.DisconnectAsync();
+        try
+        {
+            await st.Profile.DisconnectAsync();
+        }
+        catch (Exception ex)
+        {
+            AppLog($"App: disconnect failed on {st.Mac}: {ex.Message}", "E", st);
+            _statusText = "Disconnect failed: " + ex.Message;
+        }
     }
 
     private void DisableAllControlBoxes()
@@ -1094,20 +1131,16 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     // setParam / getParam controls
     // ------------------------------------------------------------------
 
-    private static bool IsSetParamError(string result)
-    {
-        return result.StartsWith("Error") || result.StartsWith("ERROR:");
-    }
-
-    private async Task<string> SendSetParam(SensorProfile profile, string key, string value)
+    private async Task<(string result, string error)> SendSetParam(SensorProfile profile, string key, string value)
     {
         try
         {
-            return await profile.SetParamAsync(key, value, CmdTimeoutMs);
+            string result = await profile.SetParamAsync(key, value, CmdTimeoutMs);
+            return (result, "");
         }
-        catch (Exception ex)
+        catch (SensorException ex)
         {
-            return "Error: " + ex.Message;
+            return ("", ex.Message);
         }
     }
 
@@ -1119,16 +1152,17 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         if (st == null || !st.Profile.IsReady)
             return;
         string value = isOn ? "ON" : "OFF";
-        string msg = await SendSetParam(st.Profile, key, value);
+        (string msg, string error) = await SendSetParam(st.Profile, key, value);
+        msg = error.Length > 0 ? error : msg;
         AppLog($"User: setParam({key}, {value}) -> {msg}");
-        RecordSavedParam(st.Mac, key, value, msg);
-        if (IsSetParamError(msg))
+        if (error.Length == 0) RecordSavedParam(st.Mac, key, value);
+        if (error.Length > 0)
         {
             ShowWarning("Set Parameter Failed", $"Failed to set {key}:\n{msg}");
-            RefreshControlStates(st);
+            await RefreshControlStates(st);
             return;
         }
-        RefreshControlStates(CurrentState());
+        await RefreshControlStates(CurrentState());
         ClearUiData();
     }
 
@@ -1140,16 +1174,17 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         if (st == null || !st.Profile.IsReady)
             return;
         string value = isOn ? "ON" : "OFF";
-        string msg = await SendSetParam(st.Profile, key, value);
+        (string msg, string error) = await SendSetParam(st.Profile, key, value);
+        msg = error.Length > 0 ? error : msg;
         AppLog($"User: setParam({key}, {value}) -> {msg}");
-        RecordSavedParam(st.Mac, key, value, msg);
-        if (IsSetParamError(msg))
+        if (error.Length == 0) RecordSavedParam(st.Mac, key, value);
+        if (error.Length > 0)
         {
             ShowWarning("Set Parameter Failed", $"Failed to set {key}:\n{msg}");
-            RefreshControlStates(st);
+            await RefreshControlStates(st);
             return;
         }
-        RefreshControlStates(CurrentState());
+        await RefreshControlStates(CurrentState());
         ClearUiData();
     }
 
@@ -1164,26 +1199,27 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         st.SetRateCurrent(kind, rate);
         _rateCurrentUi[kind] = rate;
         string mac = st.Mac;
-        Post(() => ApplySampleRate(kind, mac, rate));
+        Post(async () => await ApplySampleRate(kind, mac, rate));
     }
 
-    private async void ApplySampleRate(int kind, string mac, int rate)
+    private async Task ApplySampleRate(int kind, string mac, int rate)
     {
         DeviceState st = StateFor(mac);
         if (st == null || !st.Profile.IsReady)
             return;
         string key = SampleRateKeys[kind];
         string value = rate.ToString();
-        string msg = await SendSetParam(st.Profile, key, value);
+        (string msg, string error) = await SendSetParam(st.Profile, key, value);
+        msg = error.Length > 0 ? error : msg;
         AppLog($"User: setParam({key}, {value}) -> {msg}");
-        RecordSavedParam(st.Mac, key, value, msg);
-        if (IsSetParamError(msg))
+        if (error.Length == 0) RecordSavedParam(st.Mac, key, value);
+        if (error.Length > 0)
         {
             ShowWarning("Set Parameter Failed", $"Failed to set {key}:\n{msg}");
-            RefreshControlStates(st);
+            await RefreshControlStates(st);
             return;
         }
-        RefreshControlStates(st);
+        await RefreshControlStates(st);
         ClearUiData();
     }
 
@@ -1204,29 +1240,27 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         _rateCurrentUi[kind] = rate;
     }
 
-    private static async Task<string> SafeGetParam(SensorProfile profile, string key)
+    private static async Task<(string result, string error)> SafeGetParam(SensorProfile profile, string key)
     {
         try
         {
-            return await profile.GetParamAsync(key, 5000);
+            string result = await profile.GetParamAsync(key, 5000);
+            return (result, "");
         }
-        catch (Exception ex)
+        catch (SensorException ex)
         {
-            return "Error: " + ex.Message;
+            return ("", ex.Message);
         }
     }
 
     private static List<int> ParseRateOptions(string listResult)
     {
         var options = new List<int>();
-        if (!listResult.StartsWith("Error"))
+        foreach (string item in listResult.Split(new[] { '|' }, StringSplitOptions.RemoveEmptyEntries))
         {
-            foreach (string item in listResult.Split(new[] { '|' }, StringSplitOptions.RemoveEmptyEntries))
-            {
-                int rate;
-                if (int.TryParse(item, out rate))
-                    options.Add(rate);
-            }
+            int rate;
+            if (int.TryParse(item, out rate))
+                options.Add(rate);
         }
         return options;
     }
@@ -1234,22 +1268,24 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     private static int ParseRateCurrent(string rateResult)
     {
         int rate;
-        return !rateResult.StartsWith("Error") && int.TryParse(rateResult, out rate) ? rate : 0;
+        return int.TryParse(rateResult, out rate) ? rate : 0;
     }
 
-    private async void RefreshControlStates(DeviceState st)
+    private async Task RefreshControlStates(DeviceState st)
     {
         if (st == null)
             return;
         string mac = st.Mac;
-        string ntfResult = await SafeGetParam(st.Profile, "NTF");
-        string filterResult = await SafeGetParam(st.Profile, "FILTER");
+        (string ntfResult, string _) = await SafeGetParam(st.Profile, "NTF");
+        (string filterResult, string _) = await SafeGetParam(st.Profile, "FILTER");
         var rateListResults = new string[SampleRateGroupCount];
         var rateResults = new string[SampleRateGroupCount];
         for (int kind = 0; kind < SampleRateGroupCount; kind++)
         {
-            rateListResults[kind] = await SafeGetParam(st.Profile, SampleRateKeys[kind] + "_LIST");
-            rateResults[kind] = await SafeGetParam(st.Profile, SampleRateKeys[kind]);
+            (string listResult, string _) = await SafeGetParam(st.Profile, SampleRateKeys[kind] + "_LIST");
+            rateListResults[kind] = listResult;
+            (string currentResult, string _) = await SafeGetParam(st.Profile, SampleRateKeys[kind]);
+            rateResults[kind] = currentResult;
         }
         st = StateFor(mac);
         if (st == null)
@@ -1265,7 +1301,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         int imuCh = st.HasInfo ? Math.Max(st.Info.AccChannelCount, st.Info.GyroChannelCount) : 0;
         int ppgCh = st.HasInfo ? st.Info.PpgChannelCount : 0;
         int spo2Ch = st.HasInfo ? st.Info.Spo2ChannelCount : 0;
-        int magCh = st.HasInfo ? st.Info.MagAngleChannelCount : 0;
+        int angleCh = st.HasInfo ? st.Info.AngleChannelCount : 0;
         int impeCh = st.HasInfo ? st.Info.ImpeChannelCount : 0;
         var channelMap = new Dictionary<string, int>
         {
@@ -1276,11 +1312,11 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
             ["NTF_PPG"] = ppgCh,
             ["NTF_SPO2"] = spo2Ch,
             ["NTF_IMU"] = imuCh,
-            ["NTF_MAG_ANGLE"] = magCh,
+            ["NTF_ANGLE"] = angleCh,
         };
 
         var ntf = new Dictionary<string, Bool2>();
-        if (!ntfResult.StartsWith("Error"))
+        if (ntfResult.Length > 0)
         {
             string[] items = ntfResult.Split('|');
             for (int i = 0; i + 1 < items.Length; i += 2)
@@ -1293,7 +1329,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         }
 
         var filters = new Dictionary<string, Bool2>();
-        bool hasFilter = filterResult.Length > 0 && !filterResult.StartsWith("Error");
+        bool hasFilter = filterResult.Length > 0;
         var parsed = new Dictionary<string, string>();
         if (hasFilter)
         {
@@ -1367,7 +1403,36 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     // Debug log / bin data toggles
     // ------------------------------------------------------------------
 
-    private void ApplySdkDebugLog()
+    private async Task<(string result, string error)> SetControllerParam(string key, string value)
+    {
+        try
+        {
+            string result = await _ctrl.SetParamAsync(key, value);
+            AppLog($"App: setParam({key}, {value}) -> {result}");
+            return (result, "");
+        }
+        catch (SensorException ex)
+        {
+            AppLog($"App: setParam({key}, {value}) failed: {ex.Message}", "E");
+            Debug.LogWarning($"[SensorDemo] setParam({key}) failed: {ex.Message}");
+            return ("", ex.Message);
+        }
+    }
+
+    private async Task<(string result, string error)> GetControllerParam(string key)
+    {
+        try
+        {
+            string result = await _ctrl.GetParamAsync(key);
+            return (result, "");
+        }
+        catch (SensorException ex)
+        {
+            return ("", ex.Message);
+        }
+    }
+
+    private async Task ApplySdkDebugLog()
     {
         string version = _sdkVersion.Replace('.', '_');
         string dir = Path.Combine(
@@ -1376,53 +1441,47 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
             "Documents",
             "sensorsdklog",
             DateTime.Now.ToString("yyyyMMdd_HHmmss") + "_" + version);
-        _ = _ctrl.SetParamAsync("LOG_PATH", dir);
-        _ = _ctrl.SetParamAsync("DEBUG_ENABLED", "True");
+        await SetControllerParam("LOG_PATH", dir);
+        await SetControllerParam("DEBUG_ENABLED", "True");
         Debug.Log("[SensorDemo] LOG_PATH -> " + dir);
     }
 
-    private void OnDebugLogToggled(bool enabled)
+    private async void OnDebugLogToggled(bool enabled)
     {
         _debugLogEnabled = enabled;
         AppLog($"User: SDK debug log {(enabled ? "ON" : "OFF")}");
         if (enabled)
-            ApplySdkDebugLog();
+            await ApplySdkDebugLog();
         else
-            _ = _ctrl.SetParamAsync("DEBUG_ENABLED", "False");
+            await SetControllerParam("DEBUG_ENABLED", "False");
         string value = enabled ? "True" : "False";
-        foreach (DeviceState st in SnapshotStates())
-        {
-            if (!st.Profile.IsReady || !st.Profile.HasInited)
-                continue;
-            _ = PushDebugPathParam(st, "DEBUG_LOG_PATH", value);
-        }
+        await Task.WhenAll(SnapshotStates()
+            .Where(st => st.Profile.IsReady && st.Profile.HasInited)
+            .Select(st => PushDebugPathParam(st, "DEBUG_LOG_PATH", value)));
     }
 
-    private void OnBinDataToggled(bool enabled)
+    private async void OnBinDataToggled(bool enabled)
     {
         _binDataEnabled = enabled;
         AppLog($"User: data debug log {(enabled ? "ON" : "OFF")}");
         string value = enabled ? "True" : "False";
-        foreach (DeviceState st in SnapshotStates())
-        {
-            if (!st.Profile.IsReady || !st.Profile.HasInited)
-                continue;
-            _ = PushDebugPathParam(st, "DEBUG_BLE_DATA_PATH", value);
-        }
+        await Task.WhenAll(SnapshotStates()
+            .Where(st => st.Profile.IsReady && st.Profile.HasInited)
+            .Select(st => PushDebugPathParam(st, "DEBUG_BLE_DATA_PATH", value)));
     }
 
-    private void ApplyDongleDebug()
+    private async Task ApplyDongleDebug()
     {
         string value = _dongleDebugEnabled ? "True" : "False";
-        _ = _ctrl.SetParamAsync("BLE_TRACE_ENABLED", value);
+        await SetControllerParam("BLE_TRACE_ENABLED", value);
         Debug.Log("[SensorDemo] BLE_TRACE_ENABLED -> " + value);
     }
 
-    private void OnDongleDebugToggled(bool enabled)
+    private async void OnDongleDebugToggled(bool enabled)
     {
         _dongleDebugEnabled = enabled;
         AppLog($"User: dongle debug {(enabled ? "ON" : "OFF")}");
-        ApplyDongleDebug();
+        await ApplyDongleDebug();
     }
 
     private async void OnTranslateImuToggled(bool enabled)
@@ -1430,20 +1489,29 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         _translateImu = enabled;
         string value = enabled ? "True" : "False";
         AppLog($"User: translate IMU {(enabled ? "ON" : "OFF")}");
-        string result = await _ctrl.SetParamAsync("TRANSLATE_IMU", value);
-        AppLog($"App: setParam(TRANSLATE_IMU, {value}) -> {result}");
+        await SetControllerParam("TRANSLATE_IMU", value);
     }
 
     private async Task PushDebugPathParam(DeviceState st, string key, string value)
     {
-        string msg = await SendSetParam(st.Profile, key, value);
-        st.Profile.Log($"App: setParam({key}, {value}) -> {msg}");
-        if (IsSetParamError(msg))
+        (string msg, string error) = await SendSetParam(st.Profile, key, value);
+        msg = error.Length > 0 ? error : msg;
+        try
+        {
+            st.Profile.Log($"App: setParam({key}, {value}) -> {msg}");
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning($"[SensorDemo] log setParam({key}) failed: {ex.Message}");
+        }
+        if (error.Length > 0)
             ShowWarning("Set Parameter Failed", $"Failed to set {key}:\n{msg}");
     }
 
-    private async Task ApplySessionParams(DeviceState st)
+    private async Task ApplySessionParams(DeviceState st, bool isAutoRecovery = false)
     {
+        if (AutoRecoveryCancelled(st, isAutoRecovery))
+            return;
         // One setParam at a time (the SDK serializes setParam per profile).
         if (_debugLogEnabled)
         {
@@ -1464,17 +1532,18 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     private async Task ApplySessionParam(DeviceState st, string key, string value,
                                          Dictionary<string, string> cache)
     {
-        string msg = await SendSetParam(st.Profile, key, value);
-        if (IsSetParamError(msg))
+        (string msg, string error) = await SendSetParam(st.Profile, key, value);
+        msg = error.Length > 0 ? error : msg;
+        if (error.Length > 0)
             return;
-        string cur = await SafeGetParam(st.Profile, key);
-        if (cur.Length > 0 && !cur.StartsWith("Error"))
+        (string cur, string _) = await SafeGetParam(st.Profile, key);
+        if (cur.Length > 0)
             cache[st.Mac] = cur;
     }
 
-    private void RecordSavedParam(string mac, string key, string value, string result)
+    private void RecordSavedParam(string mac, string key, string value)
     {
-        if (mac.Length == 0 || result.StartsWith("Error"))
+        if (mac.Length == 0)
             return;
         List<KeyValuePair<string, string>> saved;
         if (!_savedParamsByMac.TryGetValue(mac, out saved))
@@ -1490,18 +1559,20 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         saved.Add(new KeyValuePair<string, string>(key, value));
     }
 
-    private async Task RestoreSavedParams(DeviceState st)
+    private async Task RestoreSavedParams(DeviceState st, bool isAutoRecovery = false)
     {
+        if (AutoRecoveryCancelled(st, isAutoRecovery))
+            return;
         string mac = st.Mac;
         List<KeyValuePair<string, string>> saved;
         if (!_savedParamsByMac.TryGetValue(mac, out saved))
             return;
         foreach (KeyValuePair<string, string> kv in saved)
         {
-            string msg = await SendSetParam(st.Profile, kv.Key, kv.Value);
-            AppLog($"App: restore setParam({kv.Key}, {kv.Value}) -> {msg}", "I", StateFor(mac));
+            (string msg, string error) = await SendSetParam(st.Profile, kv.Key, kv.Value);
+            AppLog($"App: restore setParam({kv.Key}, {kv.Value}) -> {(error.Length > 0 ? error : msg)}", "I", StateFor(mac));
         }
-        RefreshControlStates(StateFor(mac));
+        await RefreshControlStates(StateFor(mac));
         ClearUiData();
     }
 
@@ -1509,8 +1580,8 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     {
         _autoReconnect = enabled;
         AppLog($"User: auto reconnect {(enabled ? "ON" : "OFF")}");
-        foreach (DeviceState st in SnapshotStates())
-            st.Profile.AutoReconnect = enabled;
+        foreach (SensorProfile profile in _ctrl.GetSensors())
+            profile.AutoReconnect = enabled;
     }
 
     // ------------------------------------------------------------------
@@ -1595,12 +1666,8 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
 
     private async Task RefreshBackendLabelAsync()
     {
-        string backend;
-        try
-        {
-            backend = await _ctrl.GetParamAsync("BACK_END");
-        }
-        catch
+        (string backend, string error) = await GetControllerParam("BACK_END");
+        if (error.Length > 0)
         {
             Post(() => _backendQueryPending = false);
             return;
@@ -1608,7 +1675,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         Post(() =>
         {
             _backendQueryPending = false;
-            if (backend.StartsWith("Error") || backend == _backendName)
+            if (backend == _backendName)
                 return;
             _backendName = backend;
         });
@@ -1688,7 +1755,8 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
             case 0: return st.Acc;
             case 1: return st.Gyro;
             case 2: return st.Quat;
-            default: return st.Euler;
+            case 3: return st.Euler;
+            default: return st.Mag;
         }
     }
 
@@ -1696,10 +1764,11 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     {
         switch (Math.Max(0, typeIndex))
         {
-            case 0: return new[] { "ACC-X", "ACC-Y", "ACC-Z" };
-            case 1: return new[] { "GYRO-X", "GYRO-Y", "GYRO-Z" };
+            case 0: return new[] { "ACC-X (g)", "ACC-Y (g)", "ACC-Z (g)" };
+            case 1: return new[] { "GYRO-X (dps)", "GYRO-Y (dps)", "GYRO-Z (dps)" };
             case 2: return new[] { "W", "X", "Y", "Z" };
-            default: return new[] { "Pitch(Y)", "Roll(X)", "Yaw(Z)" };
+            case 3: return new[] { "Pitch(Y) (deg)", "Roll(X) (deg)", "Yaw(Z) (deg)" };
+            default: return new[] { "MAG-X (uT)", "MAG-Y (uT)", "MAG-Z (uT)" };
         }
     }
 
@@ -1879,13 +1948,13 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     {
         DeviceState st = CurrentState();
         string[] labels = LabelsForType(_typeIndex);
-        double yLow, yHigh;
+        double? yLow = null, yHigh = null;
         switch (Math.Max(0, _typeIndex))
         {
             case 0: yLow = -8; yHigh = 8; break;
             case 1: yLow = -2000; yHigh = 2000; break;
             case 2: yLow = -1; yHigh = 1; break;
-            default: yLow = -180; yHigh = 180; break;
+            case 3: yLow = -180; yHigh = 180; break;
         }
         if (st != null)
         {
@@ -1898,7 +1967,10 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
             _wave2d.SetPlaceholder("Not connected");
         }
         _wave2d.SetLabels(labels);
-        _wave2d.SetFixedYRange(yLow, yHigh);
+        if (yLow.HasValue && yHigh.HasValue)
+            _wave2d.SetFixedYRange(yLow.Value, yHigh.Value);
+        else
+            _wave2d.SetAutoYRange();
 
         _spectrum.SetLabels(labels);
         _spectrum.SetPlaceholder(_wave2d.HasSource ? "Waiting for data ..." : "Not connected");
@@ -1923,7 +1995,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
             return 1;
         int extras = (st.Info.ECGChannelCount > 0 ? 1 : 0)
                    + (st.Info.BRTHChannelCount > 0 ? 1 : 0)
-                   + (st.Info.MagAngleChannelCount > 0 ? 1 : 0);
+                   + (st.Info.AngleChannelCount > 0 ? 1 : 0);
         int perPage = _bioWaves.Count - extras;
         int total = st.Info.EEGChannelCount > 0 ? st.Info.EEGChannelCount
                   : st.Eeg.Allocated ? st.Eeg.Channels : 0;
@@ -1947,14 +2019,14 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
 
         if (kind == DeviceState.BioKind.EMG && st != null)
         {
-            // EMG device: up to 8 EMG channels, no paging. A mag-angle
-            // stream takes the row right after the EMG channel rows (a
-            // mag-only device uses this mode too).
-            bool hasMag = st.Info.MagAngleChannelCount > 0 || st.MagAngle.Allocated;
-            int emgCh = st.Emg.Allocated ? Math.Min(st.Emg.Channels, _bioWaves.Count - (hasMag ? 1 : 0)) : 0;
-            int magIndex = emgCh;
-            _bioTitle = hasMag && emgCh > 0 ? "EMG + Angle Waveform"
-                      : hasMag ? "Angle Waveform"
+            // EMG device: up to 8 EMG channels, no paging. An angle
+            // stream takes the row right after the EMG channel rows (an
+            // angle-only device uses this mode too).
+            bool hasAngle = st.Info.AngleChannelCount > 0 || st.Angle.Allocated;
+            int emgCh = st.Emg.Allocated ? Math.Min(st.Emg.Channels, _bioWaves.Count - (hasAngle ? 1 : 0)) : 0;
+            int angleIndex = emgCh;
+            _bioTitle = hasAngle && emgCh > 0 ? "EMG + Angle Waveform"
+                      : hasAngle ? "Angle Waveform"
                                : "EMG Waveform";
             for (int i = 0; i < _bioWaves.Count; i++)
             {
@@ -1962,18 +2034,18 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
                 {
                     _bioWaves[i].SetSource(st.Emg, st.BufMutex, i);
                     _bioWaves[i].SetAutoYRange();
-                    _bioWaves[i].SetLabels(new[] { $"EMG-{i + 1}" });
+                    _bioWaves[i].SetLabels(new[] { $"EMG-{i + 1} (uV)" });
                     _bioWaves[i].SetPlaceholder(string.Empty);
-                    SetBioSpectrum(i, st.Emg, i, i, $"EMG-{i + 1}");
+                    SetBioSpectrum(i, st.Emg, i, i, $"EMG-{i + 1} (uV)");
                     _bioTargets[i] = new ImpedanceTarget(st.EmgImpedance, i);
                 }
-                else if (hasMag && i == magIndex && st.MagAngle.Allocated)
+                else if (hasAngle && i == angleIndex && st.Angle.Allocated)
                 {
-                    _bioWaves[i].SetSource(st.MagAngle, st.BufMutex, 0, i);
+                    _bioWaves[i].SetSource(st.Angle, st.BufMutex, 0, i);
                     _bioWaves[i].SetFixedYRange(0.0, 180.0);
-                    _bioWaves[i].SetLabels(new[] { "Angle" });
+                    _bioWaves[i].SetLabels(new[] { "Angle (deg)" });
                     _bioWaves[i].SetPlaceholder(string.Empty);
-                    SetBioSpectrum(i, st.MagAngle, 0, i, "Angle");
+                    SetBioSpectrum(i, st.Angle, 0, i, "Angle (deg)");
                     _bioTargets[i] = new ImpedanceTarget(null, 0);
                 }
                 else
@@ -1988,10 +2060,10 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
             // ECG above it, Angle above ECG.
             bool hasECG = st.Info.ECGChannelCount > 0 || st.Ecg.Allocated;
             bool hasBRTH = st.Info.BRTHChannelCount > 0 || st.Brth.Allocated;
-            bool hasMag = st.Info.MagAngleChannelCount > 0 || st.MagAngle.Allocated;
-            _bioTitle = hasMag ? "EEG + ECG + BRTH + Angle Waveform"
+            bool hasAngle = st.Info.AngleChannelCount > 0 || st.Angle.Allocated;
+            _bioTitle = hasAngle ? "EEG + ECG + BRTH + Angle Waveform"
                                : "EEG + ECG + BRTH Waveform";
-            int perPage = _bioWaves.Count - (hasECG ? 1 : 0) - (hasBRTH ? 1 : 0) - (hasMag ? 1 : 0);
+            int perPage = _bioWaves.Count - (hasECG ? 1 : 0) - (hasBRTH ? 1 : 0) - (hasAngle ? 1 : 0);
             int total = st.Info.EEGChannelCount > 0 ? st.Info.EEGChannelCount
                       : st.Eeg.Allocated ? st.Eeg.Channels : 0;
             int pages = Math.Max(1, (total + perPage - 1) / perPage);
@@ -1999,7 +2071,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
             int startCh = _bioPage * perPage;
             int ecgIndex = _bioWaves.Count - 1 - (hasBRTH ? 1 : 0);
             int brthIndex = _bioWaves.Count - 1;
-            int magIndex = ecgIndex - (hasECG ? 1 : 0);
+            int angleIndex = ecgIndex - (hasECG ? 1 : 0);
             for (int i = 0; i < _bioWaves.Count; i++)
             {
                 int eegCh = startCh + i;
@@ -2007,36 +2079,36 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
                 {
                     _bioWaves[i].SetSource(st.Eeg, st.BufMutex, eegCh);
                     _bioWaves[i].SetAutoYRange();
-                    _bioWaves[i].SetLabels(new[] { $"EEG-{eegCh + 1}" });
+                    _bioWaves[i].SetLabels(new[] { $"EEG-{eegCh + 1} (uV)" });
                     _bioWaves[i].SetPlaceholder(string.Empty);
-                    SetBioSpectrum(i, st.Eeg, eegCh, eegCh, $"EEG-{eegCh + 1}");
+                    SetBioSpectrum(i, st.Eeg, eegCh, eegCh, $"EEG-{eegCh + 1} (uV)");
                     _bioTargets[i] = new ImpedanceTarget(st.EegImpedance, eegCh);
                 }
                 else if (hasECG && i == ecgIndex && st.Ecg.Allocated)
                 {
                     _bioWaves[i].SetSource(st.Ecg, st.BufMutex, 0);
                     _bioWaves[i].SetAutoYRange();
-                    _bioWaves[i].SetLabels(new[] { "ECG" });
+                    _bioWaves[i].SetLabels(new[] { "ECG (uV)" });
                     _bioWaves[i].SetPlaceholder(string.Empty);
-                    SetBioSpectrum(i, st.Ecg, 0, 0, "ECG");
+                    SetBioSpectrum(i, st.Ecg, 0, 0, "ECG (uV)");
                     _bioTargets[i] = new ImpedanceTarget(st.EcgImpedance, 0);
                 }
                 else if (hasBRTH && i == brthIndex && st.Brth.Allocated)
                 {
                     _bioWaves[i].SetSource(st.Brth, st.BufMutex, 0);
                     _bioWaves[i].SetAutoYRange();
-                    _bioWaves[i].SetLabels(new[] { "BRTH" });
+                    _bioWaves[i].SetLabels(new[] { "BRTH (uV)" });
                     _bioWaves[i].SetPlaceholder(string.Empty);
                     SetBioSpectrum(i, null, -1, -1, string.Empty);
                     _bioTargets[i] = new ImpedanceTarget(st.BrthImpedance, 0);
                 }
-                else if (hasMag && i == magIndex && st.MagAngle.Allocated)
+                else if (hasAngle && i == angleIndex && st.Angle.Allocated)
                 {
-                    _bioWaves[i].SetSource(st.MagAngle, st.BufMutex, 0, i);
+                    _bioWaves[i].SetSource(st.Angle, st.BufMutex, 0, i);
                     _bioWaves[i].SetFixedYRange(0.0, 180.0);
-                    _bioWaves[i].SetLabels(new[] { "Angle" });
+                    _bioWaves[i].SetLabels(new[] { "Angle (deg)" });
                     _bioWaves[i].SetPlaceholder(string.Empty);
-                    SetBioSpectrum(i, st.MagAngle, 0, i, "Angle");
+                    SetBioSpectrum(i, st.Angle, 0, i, "Angle (deg)");
                     _bioTargets[i] = new ImpedanceTarget(null, 0);
                 }
                 else
@@ -2052,12 +2124,12 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
             _bioTitle = "EEG + PPG + SpO2 Waveform";
             var plotConfig = new PpgPlot[]
             {
-                new PpgPlot(st.Eeg, 0, "fp1", true, true),
-                new PpgPlot(st.Eeg, 1, "fp2", true, true),
+                new PpgPlot(st.Eeg, 0, "fp1 (uV)", true, true),
+                new PpgPlot(st.Eeg, 1, "fp2 (uV)", true, true),
                 new PpgPlot(st.Ppg, 0, "red_led", false, true),
                 new PpgPlot(st.Ppg, 1, "ir_led", false, true),
-                new PpgPlot(st.Spo2, 0, "spo2", false, false),
-                new PpgPlot(st.Spo2, 1, "heart_rate", false, false),
+                new PpgPlot(st.Spo2, 0, "spo2 (%)", false, false),
+                new PpgPlot(st.Spo2, 1, "heart_rate (bpm)", false, false),
             };
             for (int i = 0; i < _bioWaves.Count; i++)
             {
@@ -2303,15 +2375,15 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     private static List<string> FailedMacs(Dictionary<string, bool> result)
         => result.Where(kv => !kv.Value).Select(kv => kv.Key).ToList();
 
-    private void UiMultiSync()
+    private async void UiMultiSync()
     {
         if (SnapshotStates().Any(st => st.Profile.IsDataTransfering))
-            UiMultiStop();
+            await UiMultiStop();
         else
-            UiMultiStart();
+            await UiMultiStart();
     }
 
-    private async void UiMultiStart()
+    private async Task UiMultiStart()
     {
         List<DeviceState> participants = MultiParticipants();
         if (participants.Count == 0)
@@ -2357,7 +2429,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         }
     }
 
-    private async void UiMultiStop()
+    private async Task UiMultiStop()
     {
         List<DeviceState> participants = MultiParticipants();
         if (participants.Count == 0)
@@ -2785,7 +2857,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
             {
                 if (StateFor(t.Mac) != null)
                     continue;
-                ConnectDevice(t.Mac);
+                await ConnectDevice(t.Mac);
                 await Task.Delay(2500);
             }
         }

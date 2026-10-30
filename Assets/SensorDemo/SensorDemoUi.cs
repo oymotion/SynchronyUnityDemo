@@ -315,12 +315,12 @@ public sealed partial class SensorDemoBehaviour
         if (!_cubeHasQuat)
             GUI.Label(cubeRect, "Not connected", Centered());
 
-        GUILayout.Label("2D Waveform + FFT Spectrum (ACC/GYRO/Quat/Euler)", Rich());
+        GUILayout.Label("2D Waveform + FFT Spectrum (ACC/GYRO/Quat/Euler/MAG)", Rich());
 
         // Display Data Type
         GUILayout.BeginHorizontal();
         GUILayout.Label("Display Data Type:", GUILayout.Width(120));
-        int newType = GUILayout.SelectionGrid(_typeIndex, TypeLabels, 4);
+        int newType = GUILayout.SelectionGrid(_typeIndex, TypeLabels, TypeLabels.Length);
         GUILayout.EndHorizontal();
         if (newType != _typeIndex)
         {

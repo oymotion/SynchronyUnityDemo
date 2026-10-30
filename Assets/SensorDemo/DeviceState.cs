@@ -109,11 +109,12 @@ namespace SensorSdk.ExampleUnity
         public readonly object BufMutex = new object();
         public readonly RingBuffer Acc = new RingBuffer();
         public readonly RingBuffer Gyro = new RingBuffer();
+        public readonly RingBuffer Mag = new RingBuffer();
         public readonly RingBuffer Emg = new RingBuffer();
         public readonly RingBuffer Eeg = new RingBuffer();
         public readonly RingBuffer Ecg = new RingBuffer();
         public readonly RingBuffer Brth = new RingBuffer();
-        public readonly RingBuffer MagAngle = new RingBuffer();
+        public readonly RingBuffer Angle = new RingBuffer();
         public readonly RingBuffer Ppg = new RingBuffer();
         public readonly RingBuffer Spo2 = new RingBuffer();
         public readonly RingBuffer Quat = new RingBuffer();
@@ -201,8 +202,8 @@ namespace SensorSdk.ExampleUnity
                 return BioKind.PPG;
             if (Info.EEGChannelCount > 0 || Eeg.Allocated)
                 return BioKind.EEG;
-            if (Info.EMGChannelCount > 0 || Info.MagAngleChannelCount > 0
-                || Emg.Allocated || MagAngle.Allocated)
+            if (Info.EMGChannelCount > 0 || Info.AngleChannelCount > 0
+                || Emg.Allocated || Angle.Allocated)
                 return BioKind.EMG;
             return BioKind.None;
         }
@@ -249,6 +250,7 @@ namespace SensorSdk.ExampleUnity
             {
                 case SenDataType.Acc: target = Acc; break;
                 case SenDataType.Gyro: target = Gyro; break;
+                case SenDataType.Mag: target = Mag; break;
                 case SenDataType.Quaternion: target = Quat; break;
                 case SenDataType.Euler: target = Euler; break;
                 case SenDataType.Gest:
@@ -278,8 +280,8 @@ namespace SensorSdk.ExampleUnity
                     target = Ecg; impedance = EcgImpedance; seconds = BioBufferSeconds; break;
                 case SenDataType.Brth:
                     target = Brth; impedance = BrthImpedance; seconds = BioBufferSeconds; break;
-                case SenDataType.MagAngle:
-                    target = MagAngle; seconds = BioBufferSeconds; break;
+                case SenDataType.Angle:
+                    target = Angle; seconds = BioBufferSeconds; break;
             }
             if (target == null)
                 return;
@@ -411,8 +413,8 @@ namespace SensorSdk.ExampleUnity
         {
             lock (BufMutex)
             {
-                Acc.Clear(); Gyro.Clear(); Emg.Clear(); Eeg.Clear(); Ecg.Clear();
-                Brth.Clear(); MagAngle.Clear(); Ppg.Clear(); Spo2.Clear(); Quat.Clear(); Euler.Clear();
+                Acc.Clear(); Gyro.Clear(); Mag.Clear(); Emg.Clear(); Eeg.Clear(); Ecg.Clear();
+                Brth.Clear(); Angle.Clear(); Ppg.Clear(); Spo2.Clear(); Quat.Clear(); Euler.Clear();
                 Fill(EmgImpedance, -1.0f);
                 Fill(EegImpedance, -1.0f);
                 Fill(EcgImpedance, -1.0f);
@@ -458,7 +460,8 @@ namespace SensorSdk.ExampleUnity
             new TypeLabel((int)SenDataType.Ecg, "ECG"),
             new TypeLabel((int)SenDataType.Brth, "BRTH"),
             new TypeLabel((int)SenDataType.Gest, "GEST"),
-            new TypeLabel((int)SenDataType.MagAngle, "Angle"),
+            new TypeLabel((int)SenDataType.Mag, "MAG"),
+            new TypeLabel((int)SenDataType.Angle, "Angle"),
         };
 
         private readonly struct TypeLabel
@@ -522,11 +525,12 @@ namespace SensorSdk.ExampleUnity
             {
                 case SenDataType.Acc: return "ACC";
                 case SenDataType.Gyro: return "GYRO";
+                case SenDataType.Mag: return "MAG";
                 case SenDataType.Euler: return "EULER";
                 case SenDataType.Quaternion: return "QUAT";
                 case SenDataType.Gest: return "GEST";
                 case SenDataType.Emg: return "EMG";
-                case SenDataType.MagAngle: return "Angle";
+                case SenDataType.Angle: return "Angle";
                 case SenDataType.Eeg: return "EEG";
                 case SenDataType.Ppg: return "PPG";
                 case SenDataType.Spo2: return "SPO2";

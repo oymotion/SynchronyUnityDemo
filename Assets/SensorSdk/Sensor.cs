@@ -17,6 +17,19 @@ namespace SensorSdk
         public SensorException(string message) : base(message) { }
     }
 
+    internal static class ParamResult
+    {
+        internal static string Check(string result)
+        {
+            if (result.StartsWith("Error", StringComparison.Ordinal) ||
+                result.StartsWith("ERROR:", StringComparison.Ordinal))
+            {
+                throw new SensorException(result);
+            }
+            return result;
+        }
+    }
+
     internal static class CapiString
     {
         internal static string FromBytes(byte[] bytes)
@@ -109,6 +122,13 @@ namespace SensorSdk
             {
                 return ex.Message;
             }
+        }
+
+        internal static string AwaitParam(Task<string> op, int backstopMs)
+        {
+            if (Task.WhenAny(op, Task.Delay(backstopMs)).GetAwaiter().GetResult() != op)
+                throw new SensorException("Error: Timeout");
+            return op.GetAwaiter().GetResult();
         }
     }
 
@@ -392,14 +412,14 @@ namespace SensorSdk
         public byte BRTHChannelCount;
         public byte AccChannelCount;
         public byte GyroChannelCount;
-        public byte MagAngleChannelCount;
+        public byte AngleChannelCount;
         public ushort EMGSampleRate;
         public ushort EEGSampleRate;
         public ushort ECGSampleRate;
         public ushort BRTHSampleRate;
         public ushort AccSampleRate;
         public ushort GyroSampleRate;
-        public ushort MagAngleSampleRate;
+        public ushort AngleSampleRate;
         public byte ImuChannelCount;
         public ushort ImuSampleRate;
         public byte EulerChannelCount;
@@ -421,6 +441,8 @@ namespace SensorSdk
         public string Backend = string.Empty;
         public byte GestChannelCount;
         public ushort GestSampleRate;
+        public byte MagChannelCount;
+        public ushort MagSampleRate;
 
         internal static DeviceInfo FromNative(in SenDeviceInfo i)
         {
@@ -441,14 +463,14 @@ namespace SensorSdk
                 BRTHChannelCount = i.BRTHChannelCount,
                 AccChannelCount = i.AccChannelCount,
                 GyroChannelCount = i.GyroChannelCount,
-                MagAngleChannelCount = i.MagAngleChannelCount,
+                AngleChannelCount = i.AngleChannelCount,
                 EMGSampleRate = i.EMGSampleRate,
                 EEGSampleRate = i.EEGSampleRate,
                 ECGSampleRate = i.ECGSampleRate,
                 BRTHSampleRate = i.BRTHSampleRate,
                 AccSampleRate = i.AccSampleRate,
                 GyroSampleRate = i.GyroSampleRate,
-                MagAngleSampleRate = i.MagAngleSampleRate,
+                AngleSampleRate = i.AngleSampleRate,
                 ImuChannelCount = i.ImuChannelCount,
                 ImuSampleRate = i.ImuSampleRate,
                 EulerChannelCount = i.EulerChannelCount,
@@ -469,7 +491,9 @@ namespace SensorSdk
                 SupervisionTimeoutMs = i.SupervisionTimeoutMs,
                 Backend = CapiString.FromBytes(i.backend),
                 GestChannelCount = i.GestChannelCount,
-                GestSampleRate = i.GestSampleRate
+                GestSampleRate = i.GestSampleRate,
+                MagChannelCount = i.MagChannelCount,
+                MagSampleRate = i.MagSampleRate
             };
         }
     }
@@ -686,18 +710,18 @@ namespace SensorSdk
             return outInfo;
         }
 
-        public Task<string> SetParamAsync(string key, string value, int timeoutMs = 0)
+        public async Task<string> SetParamAsync(string key, string value, int timeoutMs = 0)
         {
             var op = new CompletionOp<string>();
             Native.sen_profile_set_param(Handle, timeoutMs, key, value, NativeCallbacks.Param, op.CtxPtr);
-            return op.Task;
+            return ParamResult.Check(await op.Task.ConfigureAwait(false));
         }
 
-        public Task<string> GetParamAsync(string key, int timeoutMs = 0)
+        public async Task<string> GetParamAsync(string key, int timeoutMs = 0)
         {
             var op = new CompletionOp<string>();
             Native.sen_profile_get_param(Handle, timeoutMs, key, NativeCallbacks.Param, op.CtxPtr);
-            return op.Task;
+            return ParamResult.Check(await op.Task.ConfigureAwait(false));
         }
 
         public bool Connect()
@@ -738,14 +762,14 @@ namespace SensorSdk
         public string SetParam(string key, string value, int timeoutMs = 0)
         {
             CallbackGuard.ThrowOnSdkCallbackThread();
-            return SyncWait.AwaitString(SetParamAsync(key, value, timeoutMs),
+            return SyncWait.AwaitParam(SetParamAsync(key, value, timeoutMs),
                 (timeoutMs > 0 ? timeoutMs : SensorController.AssumedCmdTimeoutMs) + 15000);
         }
 
         public string GetParam(string key, int timeoutMs = 0)
         {
             CallbackGuard.ThrowOnSdkCallbackThread();
-            return SyncWait.AwaitString(GetParamAsync(key, timeoutMs),
+            return SyncWait.AwaitParam(GetParamAsync(key, timeoutMs),
                 (timeoutMs > 0 ? timeoutMs : SensorController.AssumedCmdTimeoutMs) + 15000);
         }
 
@@ -1638,11 +1662,11 @@ namespace SensorSdk
                 return true;
             }, capacity: 256);
 
-        public Task<string> GetParamAsync(string key)
+        public async Task<string> GetParamAsync(string key)
         {
             var op = new CompletionOp<string>();
             Native.sen_controller_get_param(_handle, key, NativeCallbacks.Param, op.CtxPtr);
-            return op.Task;
+            return ParamResult.Check(await op.Task.ConfigureAwait(false));
         }
 
         public async Task<string> SetParamAsync(string key, string value)
@@ -1650,7 +1674,7 @@ namespace SensorSdk
             var op = new CompletionOp<string>();
             Native.sen_controller_set_param(_handle, key, value,
                 NativeCallbacks.Param, op.CtxPtr);
-            string result = await op.Task.ConfigureAwait(false);
+            string result = ParamResult.Check(await op.Task.ConfigureAwait(false));
             if (key == "CMD_TIMEOUT_MS" && result == "OK" &&
                 int.TryParse(value, out int ms) && ms > 0)
             {
@@ -1669,13 +1693,13 @@ namespace SensorSdk
         public string GetParam(string key)
         {
             CallbackGuard.ThrowOnSdkCallbackThread();
-            return SyncWait.AwaitString(GetParamAsync(key), 20000);
+            return SyncWait.AwaitParam(GetParamAsync(key), 20000);
         }
 
         public string SetParam(string key, string value)
         {
             CallbackGuard.ThrowOnSdkCallbackThread();
-            return SyncWait.AwaitString(SetParamAsync(key, value), 20000);
+            return SyncWait.AwaitParam(SetParamAsync(key, value), 20000);
         }
 
         public string CheckSetupDongle()
