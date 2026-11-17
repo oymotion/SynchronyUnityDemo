@@ -6,46 +6,48 @@ OYMotion SDK demo for Unity.
 
 Full-featured multi-device demo over the C# bindings in
 `bindings/csharp/` (`SensorCapi.cs` + `Sensor.cs`, installed into
-`Assets/SensorSdk/`). Everything is code-built: no scene setup, no prefabs,
-no Unity packages. The UI is IMGUI with three pages (Device / Bio / IMU, Qt
-mobile layout parity), drawn by a self-spawning `MonoBehaviour`
-(`RuntimeInitializeOnLoadMethod`) — press Play and the demo appears.
+`Assets/SensorSdk/`). The UI is IMGUI with three pages (Device / Bio / IMU,
+Qt mobile layout parity), driven by a single `SensorDemoBehaviour`
+`MonoBehaviour` on a GameObject in the shipped scene
+(`Assets/Scenes/Sample_Android.unity`) — open the scene and press Play.
+(Defining `RUN_IN_START` in `SensorDemoBehaviour.cs` switches back to the
+self-spawning `RuntimeInitializeOnLoadMethod` mode with zero scene setup.)
 Feature parity with the Qt demo (`example_qt`) via the WinUI3 demo
 (`example_cs_winui3`); the header row carries the SDK version and the
 demo's own version (bump +0.0.1 per demo change).
 
 Unity 2021.3+ (.NET Standard 2.1 API compatibility level — the default).
 Targets Windows (x86_64 / x86), Android (arm64-v8a / x86 / x86_64), iOS,
-macOS and Linux (x86_64 / x86 / arm64) players; Mono editor and IL2CPP
-standalone builds both work.
+macOS and Linux (x86_64 / x86 / arm64) players; Mono editor and IL2CPP standalone
+builds both work.
 
 ## Setup
 
 This repository **is** the Unity project, with everything pre-installed:
 
-- `Assets/SensorSdk/SensorCapi.cs` + `Sensor.cs` — the C# bindings
-- `Assets/SensorDemo/` — the demo (`SensorDemoBehaviour.cs` logic +
-  `SensorDemoUi.cs` IMGUI layout, `DeviceState.cs`, `LiveFilter.cs`,
-  `SpectrumCompute.cs`, `WaveformView.cs`, `SpectrumView.cs`, plus the
-  `Editor/` iOS build post-processor)
+- `Assets/SensorSdk/SensorCapi.cs` + `Sensor.cs` — the C# bindings.
+- `Assets/SensorDemo/` — the demo logic, IMGUI layout, waveform/spectrum
+  views, filters, cube shader and Editor build hooks.
+- `Assets/Scenes/Sample_Android.unity` — the scene containing the
+  `SensorDemo` GameObject and its pinned script reference.
 - `Assets/Plugins/Windows/x86_64/sensor.dll` and
-  `Assets/Plugins/Windows/x86/sensor.dll` — the Windows SDK runtimes
-  (64-bit / 32-bit, Release), each with a prepared `.meta` pinning the
-  PluginImporter Platform/CPU settings
+  `Assets/Plugins/Windows/x86/sensor.dll` — the Windows SDK runtimes.
 - `Assets/Plugins/Android/sensorcapi-release.aar` + a BLE-permission
-  `AndroidManifest.xml` — the AAR bundles the Java BLE bridge and
-  libsensor.so for arm64-v8a / x86 / x86_64
-- `Assets/Plugins/iOS/sensor.xcframework` — iOS device + simulator slices
-- `Assets/Plugins/Linux/x86_64/libsensor.so` and
-  `Assets/Plugins/Linux/x86/libsensor.so` — the Linux runtimes (64-bit /
-  32-bit)
-- `Assets/Plugins/Linux/arm64/libsensor.so` — the Linux ARM64 runtime
+  `AndroidManifest.xml` — the Android SDK and Java BLE bridge.
+- `Assets/Plugins/iOS/sensor.xcframework` — iOS device and simulator slices.
+- `Assets/Plugins/OSX/libsensor.dylib` — the macOS runtime.
+- `Assets/Plugins/Linux/x86_64/libsensor.so`,
+  `Assets/Plugins/Linux/x86/libsensor.so`, and
+  `Assets/Plugins/Linux/arm64/libsensor.so` — the Linux runtimes.
 
-Just open the project with Unity **2021.3+** (.NET Standard 2.1 API
-compatibility level — the default) and press **Play**. SDK file logs land
-in `%USERPROFILE%\Documents\sensorsdklog\<yyyyMMdd_HHmmss>_<sdk version>`
+Open the project with Unity **2021.3+**, open
+`Assets/Scenes/Sample_Android.unity` and press **Play**. The native plugins
+already include prepared `.meta` files with their Platform/CPU settings. SDK
+file logs land in
+`%USERPROFILE%\Documents\sensorsdklog\<yyyyMMdd_HHmmss>_<sdk version>`
 (the demo sets the path via the `LOG_PATH` controller parameter before
 enabling `DEBUG_ENABLED`).
+
 ## 1. Permission
 
 - **Windows / Linux editor and players**: no capability declaration or
@@ -105,8 +107,11 @@ also traced as a warning at controller creation).
 
 ### 2. Start scan
 
-Use `bool StartScan(int periodInMs)` to start scanning; `DeviceFound` fires
-every `periodInMs`:
+Use `bool StartScan(int periodInMs)` to start scanning. `periodInMs` sets the
+periodic summary interval, not a callback throttle. `DeviceFound` fires
+immediately when a new device is discovered to minimize discovery latency,
+and again each period with the current non-empty device list (including
+RSSI-only updates). Empty periodic summaries are skipped:
 
 ```csharp
 bool success = controller.StartScan(6000);
@@ -274,7 +279,7 @@ values in order -> `StartDataNotificationAsync`. Explicit user calls
 cancel the pending resume.
 
 ```csharp
-sensorProfile.SetAutoReconnect(true);   // default; false to opt out
+sensorProfile.AutoReconnect = true;   // default; false to opt out
 ```
 
 **Custom recovery via `OnAutoReconnect`**: when the auto-reconnect finds the
@@ -304,7 +309,7 @@ DeviceInfo deviceInfo = sensorProfile.GetDeviceInfo();
 
 // fields: DeviceName, ModelName, HardwareVersion, FirmwareVersion, MTUSize
 // plus a ChannelCount / SampleRate field pair per modality:
-//   Ppg, Spo2, Impe, EMG, EEG, ECG, Acc, Gyro, BRTH, MagAngle, Euler, Quat
+//   Ppg, Spo2, Impe, EMG, EEG, ECG, Acc, Gyro, BRTH, Angle, Euler, Quat, Mag
 // plus EmgMaxSampleRate / EegMaxSampleRate / EcgMaxSampleRate (maximum rate
 //   from the capability query, 0 = not reported)
 // plus ImuChannelCount / ImuSampleRate (aggregated IMU stream; 0 = none)
@@ -355,7 +360,8 @@ await sensorProfile.StartDataNotificationAsync();
 //   Quaternion = 0x5     // quaternion (w, x, y, z)
 //   Gest = 0x07          // gesture id
 //   Emg = 0x8            // unit is uV
-//   MagAngle = 0x0D
+//   Angle = 0x0D         // joint angle (magnetic rotary encoder)
+//   Mag = 0x3            // 3-axis magnetometer, unit is uT
 //   Eeg = 0x10           // unit is uV
 //   Ecg = 0x11           // unit is uV
 //   Impedance = 0x12     // electrode impedance
@@ -486,7 +492,7 @@ await sensorProfile.SetParamAsync("NTF_ECG", "ON");
 await sensorProfile.SetParamAsync("NTF_IMU", "ON");
 await sensorProfile.SetParamAsync("NTF_BRTH", "ON");
 await sensorProfile.SetParamAsync("NTF_IMPEDANCE", "ON");
-await sensorProfile.SetParamAsync("NTF_MAG_ANGLE", "ON");
+await sensorProfile.SetParamAsync("NTF_ANGLE", "ON");
 await sensorProfile.SetParamAsync("NTF_PPG", "ON");
 await sensorProfile.SetParamAsync("NTF_PPG_RAW", "ON");   // alias of NTF_PPG
 await sensorProfile.SetParamAsync("NTF_SPO2", "ON");
@@ -501,8 +507,12 @@ await sensorProfile.SetParamAsync("FILTER_LPF", "ON");    // 80Hz low-pass
 
 // EEG/ECG sample rate (bound together on devices that have both)
 await sensorProfile.SetParamAsync("EEG_SAMPLE_RATE", "500");
-// Validated against the device-reported capability list (see
-// getParam("EEG_SAMPLE_RATE_LIST")); an unsupported value returns
+// EMG / IMU / PPG sample rates (on devices that support them)
+await sensorProfile.SetParamAsync("EMG_SAMPLE_RATE", "1000");
+await sensorProfile.SetParamAsync("IMU_SAMPLE_RATE", "200");
+await sensorProfile.SetParamAsync("PPG_SAMPLE_RATE", "200");
+// Each is validated against the device-reported capability list (see
+// getParam("<X>_SAMPLE_RATE_LIST")); an unsupported value returns
 // "Error: unsupported sample rate ...".
 
 // NeuCir remote control (NeuCir devices only)
@@ -518,6 +528,10 @@ await sensorProfile.SetParamAsync("DEBUG_BLE_DATA_PATH", "True");
 await sensorProfile.SetParamAsync("DEBUG_LOG_PATH", "True");
 // enable this profile's log file ({DeviceName}_log_YYYYMMDD_HHMMSS.txt in
 // the SDK log directory), or pass an absolute path; "False" / "" disables.
+
+// Flush this device's pending bin capture and SDK log to disk; the value
+// is ignored
+await sensorProfile.SetParamAsync("FLUSH_BLE_DATA", "");
 ```
 
 ### getParam method
@@ -536,6 +550,10 @@ result = await sensorProfile.GetParamAsync("NTF");
 
 result = await sensorProfile.GetParamAsync("EEG_SAMPLE_RATE");       // e.g. "250"
 result = await sensorProfile.GetParamAsync("EEG_SAMPLE_RATE_LIST");  // e.g. "250|500"
+// The same pair exists for the other streams: "EMG_SAMPLE_RATE" /
+// "EMG_SAMPLE_RATE_LIST", "IMU_SAMPLE_RATE" / "IMU_SAMPLE_RATE_LIST",
+// "PPG_SAMPLE_RATE" / "PPG_SAMPLE_RATE_LIST"; an unsupported stream
+// answers "Error: Not supported".
 ```
 
 ## Bin file recording and replay
@@ -635,15 +653,15 @@ the default per-profile logs (`DEBUG_LOG_PATH=True`) and the default bin
 exports (`DEBUG_BLE_DATA_PATH=True`).
 
 ```csharp
-await controller.SetParamAsync("LOG_PATH", "d:/temp/sdklogs");
-// set the log directory (created if missing) — set it BEFORE enabling
-// DEBUG_ENABLED so the session's logs land in one place. "False" disables
-// file output; "True" resets to the default (Documents/sensorsdklog).
-
-await controller.SetParamAsync("DEBUG_ENABLED", "True");
+controller.SetParam("DEBUG_ENABLED", "True");
 // enable SDK debug logs; creates the controller log
 // (sensor_controller_log_YYYYMMDD_HHMMSS.txt) in the log directory.
 // "False" closes it and drops all file output.
+
+controller.SetParam("LOG_PATH", "d:/temp/sdklogs");
+// set the log directory (created if missing). "False" disables
+// file output; "True" resets to the default
+// (Documents/sensorsdklog).
 ```
 
 ### Application log entries
@@ -669,28 +687,38 @@ log, the rest in the controller log.
 
 ## What this demo does
 
-- **Device page**: Start/Stop Scan, an RSSI-sorted device list with
+- **Device page**: Start/Stop Scan, an RSSI insertion-sorted device list
+  (a device missing from three consecutive scan rounds is evicted;
+  connected/replay rows are exempt) with
   in-place `[Connected]` / `[Streaming]` row marks. The selected row is the
   *current* device whose pages and setParam controls are bound to; Connect /
-  Disconnect affects only the selected device. Any number of devices stream
+  Disconnect affects only the selected device (Connect stops a running scan
+  first). Any number of devices stream
   at once. Status/rate lines (per-type nominal + measured rates, stream
   start time, first-packet delay), Model / HW / FW / Link / MTU / Power
-  labels (battery pushed by the SDK polling), Packet Loss Stats and Gesture
+  labels (battery pushed by the SDK polling; the Link line also names the
+  active BLE backend), Packet Loss Stats and Gesture
   boxes.
 - **Toggles**: **Auto Reconnect** (default ON; the demo takes over recovery
   itself — the `OnAutoReconnect` query is answered with `true`, and once
   the link is back the demo re-selects the device row, re-runs the
   connect/init/stream chain, and re-applies the recorded setParam history
-  one command at a time when a last session was restored; every disconnect
-  tears the device UI state down unconditionally) and **Clone Data** (safe
+  one command at a time when a last session was restored. Turning it off
+  declines app-driven recovery and cancels later recovery stages at the
+  next recovery-method entry check; a method already in progress may finish.
+  Manual Connect is unaffected. Every disconnect tears the device UI state
+  down unconditionally) and **Clone Data** (safe
   deep-copy vs zero-copy batch queueing; default off = zero-copy).
 - **Settings**: Enable SDK Debug Log / Enable Debug Bin Data (the session's
   logs and .bin exports land in one timestamped subdir of
-  `Documents/sensorsdklog`), Data Notification switches (EEG/EMG/GESTURE/
-  PPG/SpO2/IMU, capability-gated by the device info), Filter switches
-  (50Hz/60Hz/HPF/LPF, never hidden), EEG Sample Rate radios
-  (250/500/1000/2000 Hz, capability-gated by `EEG_SAMPLE_RATE_LIST`;
-  unsupported rates and the whole group on EEG-less devices are hidden).
+  `Documents/sensorsdklog`), Data Notification switches (EEG/IMPE/EMG/GESTURE/
+  PPG/SpO2/IMU/Angle, capability-gated by the device info), Filter switches
+  (50Hz/60Hz/HPF/LPF, never hidden), Sample Rate radio groups
+  (EEG 250/500/1000/2000 Hz, EMG 500/1000 Hz, IMU
+  50/100/200/250/400/500/1000/2000 Hz, PPG 50/100/200/400/800/1000/
+  1600/3200 Hz; each group is capability-gated by its
+  `<X>_SAMPLE_RATE_LIST` and hidden entirely while that option list is
+  empty, and unsupported candidates stay hidden once it is known).
 - **Bio page**: 8 waveform rows, auto-selected by device capability — EMG
   channels, or paged EEG channels plus ECG/BRTH slots (Prev/Next +
   "Page x / y"), or the PPG fixed plot set (EEG fp1/fp2 + PPG red/ir + SpO2
@@ -701,8 +729,8 @@ log, the rest in the controller log.
   500 / orange <= 999 / red above, KOhm). The **Live Filter** band selector
   (Off / delta / theta / alpha / beta / gamma) band-passes the bio
   waveforms of every device.
-- **IMU page**: ACC / GYRO / Quat / Euler 2D waveform (fixed Y ranges) in a
-  50/50 row with its FFT spectrum strip on the left (recomputed every
+- **IMU page**: ACC / GYRO / Quat / Euler 2D waveform (fixed Y ranges)
+  full-width with its FFT spectrum strip below it (recomputed every
   200 ms on a worker thread), a Display Data Type selector, real-time value
   labels, and a true-3D
   quaternion cube (a GameObject rendered by a dedicated camera whose
@@ -717,9 +745,12 @@ log, the rest in the controller log.
   (refused while devices are connected); each member gets its own
   `[Replay]` row.
 - **Multi Start/Stop**: a toggle button in the header row right of the SDK
-  version label — synchronized stream start/stop across all connected
+  version label (which also names the active BLE backend) — synchronized
+  stream start/stop across all connected
   devices (reads "Multi Stop" while any device is streaming); next to it,
-  **Multi Replay Bin** starts a synchronized group replay.
+  **Multi Replay Bin** starts a synchronized group replay, and the
+  **Check Dongle** button runs the SDK's USB dongle setup check (driver
+  install/rebind flow on desktop; reports the usable dongle count).
 
 SDK callbacks arrive on SDK threads; the demo never touches UnityEngine
 APIs there — event callbacks only post `Action`s into a queue drained by
@@ -737,7 +768,16 @@ feeds the per-device display rings; views repaint at most once per 50 ms).
 - **Android**: the AAR (Java BLE bridge + libsensor.so for arm64-v8a /
   x86 / x86_64) and the BLE-permission manifest are installed by the setup
   script. At startup the demo instantiates `SensorBleBridge` over
-  `AndroidJavaObject`, calls `setBridge()` and `requestBlePermissions()`.
+  `AndroidJavaObject`, calls `setBridge()` and `requestBlePermissions()`,
+  and additionally requests the runtime permissions itself
+  (`UnityEngine.Android.Permission`: fine/coarse location, BLUETOOTH_SCAN /
+  BLUETOOTH_CONNECT and the legacy pair — needs the
+  `com.unity.modules.androidjni` package, present by default in new
+  projects). The IMU cube's `SensorDemo/CubeFace` shader is looked up with
+  `Shader.Find` at runtime; `Editor/SensorDemoBuildSetup.cs` adds it to the
+  Always Included Shaders list and puts the `Sample_Android` scene into
+  Build Settings before every build (nothing else references the shader,
+  so shader stripping would otherwise drop it from player builds).
   `OnApplicationQuit` teardown applies to Android players the same as
   desktop.
 - **iOS**: `sensor.xcframework` (device + simulator slices) is statically
@@ -745,9 +785,9 @@ feeds the per-device display rings; views repaint at most once per 50 ms).
   must be installed for the Editor post-processor script to compile.
 - **macOS**: copy a Mac-built `libsensor.dylib` into `Assets/Plugins/OSX/`
   (the setup script does this when the file exists).
-- **Linux**: the x86_64/x86 plugin is the WSL-built `libsensor_x86.so`
-  renamed to `libsensor.so`, the arm64 one is the docker-built
-  `libsensor_arm64.so`; it links glib-2.0/gio-2.0 dynamically, so the target
+- **Linux**: the x86_64/x86 plugin is the WSL-built `libsensor_x86.so`, the
+  arm64 one is the docker-built `libsensor_arm64.so`, each renamed to
+  `libsensor.so`; it links glib-2.0/gio-2.0 dynamically, so the target
   machine needs the standard glib runtime (preinstalled on desktop Linux).
 - **Editor hangs entering Play mode**: on some machines Unity 2021.3
   deadlocks while entering Play (the log stops at "Setting up N worker

@@ -212,6 +212,8 @@ namespace SensorSdk.Capi
     internal delegate void SenScanResultCb(IntPtr ctx, IntPtr devices, UIntPtr count);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate void SenEnableChangedCb(IntPtr ctx, int enabled);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate void SenScanStateCb(IntPtr ctx, int isScanning, IntPtr errorMsg);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate void SenDataCb(IntPtr ctx, IntPtr profile, IntPtr views, UIntPtr viewCount);
@@ -250,6 +252,7 @@ namespace SensorSdk.Capi
         public uint structSize;
         public IntPtr onScanResult;
         public IntPtr onEnableChanged;
+        public IntPtr onScanStateChange;
     }
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
@@ -274,7 +277,7 @@ namespace SensorSdk.Capi
 #endif
         private const CallingConvention Cc = CallingConvention.Cdecl;
 
-        internal const uint ExpectedCapiVersion = 22;
+        internal const uint ExpectedCapiVersion = 24;
 
         [DllImport(Dll, CallingConvention = Cc)]
         internal static extern void sen_terminate();
@@ -470,6 +473,9 @@ namespace SensorSdk.Capi
 
         [DllImport(Dll, CallingConvention = Cc)]
         internal static extern int sen_profile_get_auto_reconnect(IntPtr profile);
+
+        [DllImport(Dll, CallingConvention = Cc)]
+        internal static extern int sen_profile_is_auto_reconnecting(IntPtr profile);
 
         [DllImport(Dll, CallingConvention = Cc, CharSet = CharSet.Ansi)]
         internal static extern void sen_profile_log(

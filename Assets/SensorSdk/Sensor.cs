@@ -63,19 +63,31 @@ namespace SensorSdk
 
     internal static class CallbackGuard
     {
-        private static readonly ConcurrentDictionary<int, byte> SdkCallbackThreads = new();
+        private static readonly ThreadLocal<int> CallbackDepth = new(() => 0);
 
         internal static void Log(Exception ex)
             => Console.Error.WriteLine("sensor callback threw: " + ex);
 
-        internal static void MarkSdkCallbackThread()
-            => SdkCallbackThreads.TryAdd(Environment.CurrentManagedThreadId, 0);
+        internal static IDisposable Enter()
+        {
+            ++CallbackDepth.Value;
+            return new Scope();
+        }
 
         internal static void ThrowOnSdkCallbackThread()
         {
-            if (SdkCallbackThreads.ContainsKey(Environment.CurrentManagedThreadId))
+            if (CallbackDepth.Value > 0)
                 throw new InvalidOperationException(
                     "blocking sync call from an SDK callback thread");
+        }
+
+        private sealed class Scope : IDisposable
+        {
+            public void Dispose()
+            {
+                if (CallbackDepth.Value > 0)
+                    --CallbackDepth.Value;
+            }
         }
     }
 
@@ -794,6 +806,8 @@ namespace SensorSdk
             set => Native.sen_profile_set_auto_reconnect(Handle, value ? 1 : 0);
         }
 
+        public bool IsAutoReconnecting => Native.sen_profile_is_auto_reconnecting(Handle) != 0;
+
         public void Log(string message, string level = "I")
         {
             try
@@ -977,6 +991,7 @@ namespace SensorSdk
         internal static readonly SenScanResultCb ScanResult = OnScanResult;
         internal static readonly SenScanResultCb ScanOnceResult = OnScanOnceResult;
         internal static readonly SenEnableChangedCb EnableChanged = OnEnableChanged;
+        internal static readonly SenScanStateCb ScanState = OnScanState;
         internal static readonly SenCompletionCb Completion = OnCompletion;
         internal static readonly SenCompletionCb BoolCompletion = OnBoolCompletion;
         internal static readonly SenParamCb Param = OnParam;
@@ -990,7 +1005,7 @@ namespace SensorSdk
         [MonoPInvokeCallback(typeof(SenDataCb))]
         private static void OnData(IntPtr ctx, IntPtr profile, IntPtr views, UIntPtr viewCount)
         {
-            CallbackGuard.MarkSdkCallbackThread();
+            using var callbackScope = CallbackGuard.Enter();
             try
             {
                 ProfileFromCtx(ctx).RaiseData(views, checked((int)viewCount));
@@ -1004,7 +1019,7 @@ namespace SensorSdk
         [MonoPInvokeCallback(typeof(SenStateCb))]
         private static void OnState(IntPtr ctx, IntPtr profile, int newState)
         {
-            CallbackGuard.MarkSdkCallbackThread();
+            using var callbackScope = CallbackGuard.Enter();
             try
             {
                 ProfileFromCtx(ctx).RaiseState(newState);
@@ -1018,7 +1033,7 @@ namespace SensorSdk
         [MonoPInvokeCallback(typeof(SenErrorCb))]
         private static void OnError(IntPtr ctx, IntPtr profile, IntPtr errorMsg)
         {
-            CallbackGuard.MarkSdkCallbackThread();
+            using var callbackScope = CallbackGuard.Enter();
             try
             {
                 ProfileFromCtx(ctx).RaiseError(errorMsg);
@@ -1032,7 +1047,7 @@ namespace SensorSdk
         [MonoPInvokeCallback(typeof(SenPowerCb))]
         private static void OnPower(IntPtr ctx, IntPtr profile, int power)
         {
-            CallbackGuard.MarkSdkCallbackThread();
+            using var callbackScope = CallbackGuard.Enter();
             try
             {
                 ProfileFromCtx(ctx).RaisePower(power);
@@ -1047,7 +1062,7 @@ namespace SensorSdk
         private static void OnAutoReconnect(IntPtr ctx, IntPtr profile, int hasLastSession,
                                             IntPtr answer, IntPtr answerCtx)
         {
-            CallbackGuard.MarkSdkCallbackThread();
+            using var callbackScope = CallbackGuard.Enter();
             try
             {
                 ProfileFromCtx(ctx).RaiseAutoReconnect(hasLastSession, answer, answerCtx);
@@ -1061,7 +1076,7 @@ namespace SensorSdk
         [MonoPInvokeCallback(typeof(SenDeviceInfoUpdateCb))]
         private static void OnDeviceInfoUpdate(IntPtr ctx, IntPtr profile, IntPtr info)
         {
-            CallbackGuard.MarkSdkCallbackThread();
+            using var callbackScope = CallbackGuard.Enter();
             try
             {
                 ProfileFromCtx(ctx).RaiseDeviceInfoUpdate(info);
@@ -1075,7 +1090,7 @@ namespace SensorSdk
         [MonoPInvokeCallback(typeof(SenDataTransferStateCb))]
         private static void OnDataTransferState(IntPtr ctx, IntPtr profile, int isTransferring)
         {
-            CallbackGuard.MarkSdkCallbackThread();
+            using var callbackScope = CallbackGuard.Enter();
             try
             {
                 ProfileFromCtx(ctx).RaiseDataTransferState(isTransferring);
@@ -1089,7 +1104,7 @@ namespace SensorSdk
         [MonoPInvokeCallback(typeof(SenScanResultCb))]
         private static void OnScanResult(IntPtr ctx, IntPtr devices, UIntPtr count)
         {
-            CallbackGuard.MarkSdkCallbackThread();
+            using var callbackScope = CallbackGuard.Enter();
             try
             {
                 ((SensorController)GCHandle.FromIntPtr(ctx).Target!)
@@ -1104,14 +1119,14 @@ namespace SensorSdk
         [MonoPInvokeCallback(typeof(SenScanResultCb))]
         private static void OnScanOnceResult(IntPtr ctx, IntPtr devices, UIntPtr count)
         {
-            CallbackGuard.MarkSdkCallbackThread();
+            using var callbackScope = CallbackGuard.Enter();
             ScanOnceOp.Complete(ctx, devices, checked((int)count));
         }
 
         [MonoPInvokeCallback(typeof(SenEnableChangedCb))]
         private static void OnEnableChanged(IntPtr ctx, int enabled)
         {
-            CallbackGuard.MarkSdkCallbackThread();
+            using var callbackScope = CallbackGuard.Enter();
             try
             {
                 ((SensorController)GCHandle.FromIntPtr(ctx).Target!).RaiseEnableChanged(enabled != 0);
@@ -1122,10 +1137,25 @@ namespace SensorSdk
             }
         }
 
+        [MonoPInvokeCallback(typeof(SenScanStateCb))]
+        private static void OnScanState(IntPtr ctx, int isScanning, IntPtr errorMsg)
+        {
+            using var callbackScope = CallbackGuard.Enter();
+            try
+            {
+                ((SensorController)GCHandle.FromIntPtr(ctx).Target!)
+                    .RaiseScanStateChanged(isScanning != 0, Marshal.PtrToStringUTF8(errorMsg) ?? "");
+            }
+            catch (Exception ex)
+            {
+                CallbackGuard.Log(ex);
+            }
+        }
+
         [MonoPInvokeCallback(typeof(SenCompletionCb))]
         private static void OnCompletion(IntPtr ctx, int result, IntPtr errorMsg)
         {
-            CallbackGuard.MarkSdkCallbackThread();
+            using var callbackScope = CallbackGuard.Enter();
             try
             {
                 CompletionOp<string>.Complete(ctx, result, errorMsg, msg => msg);
@@ -1139,7 +1169,7 @@ namespace SensorSdk
         [MonoPInvokeCallback(typeof(SenCompletionCb))]
         private static void OnBoolCompletion(IntPtr ctx, int result, IntPtr errorMsg)
         {
-            CallbackGuard.MarkSdkCallbackThread();
+            using var callbackScope = CallbackGuard.Enter();
             try
             {
                 CompletionOp<bool>.Complete(ctx, errorMsg, _ => result != 0);
@@ -1153,7 +1183,7 @@ namespace SensorSdk
         [MonoPInvokeCallback(typeof(SenParamCb))]
         private static void OnParam(IntPtr ctx, IntPtr result, IntPtr errorMsg)
         {
-            CallbackGuard.MarkSdkCallbackThread();
+            using var callbackScope = CallbackGuard.Enter();
             try
             {
                 CompletionOp<string>.Complete(ctx, errorMsg,
@@ -1168,7 +1198,7 @@ namespace SensorSdk
         [MonoPInvokeCallback(typeof(SenBatteryCb))]
         private static void OnBattery(IntPtr ctx, int result, IntPtr errorMsg)
         {
-            CallbackGuard.MarkSdkCallbackThread();
+            using var callbackScope = CallbackGuard.Enter();
             try
             {
                 CompletionOp<int>.Complete(ctx, errorMsg, _ => result);
@@ -1182,7 +1212,7 @@ namespace SensorSdk
         [MonoPInvokeCallback(typeof(SenInfoCb))]
         private static void OnInfo(IntPtr ctx, IntPtr info, IntPtr errorMsg)
         {
-            CallbackGuard.MarkSdkCallbackThread();
+            using var callbackScope = CallbackGuard.Enter();
             try
             {
                 CompletionOp<DeviceInfo>.Complete(ctx, errorMsg, _ =>
@@ -1201,7 +1231,7 @@ namespace SensorSdk
         private static void OnMultiResult(
             IntPtr ctx, IntPtr macs, IntPtr oks, IntPtr errors, UIntPtr count)
         {
-            CallbackGuard.MarkSdkCallbackThread();
+            using var callbackScope = CallbackGuard.Enter();
             try
             {
                 MultiResultOp.Complete(ctx, macs, oks, errors, count);
@@ -1359,6 +1389,7 @@ namespace SensorSdk
 
         public event Action<List<BleDevice>>? DeviceFound;
         public event Action<bool>? EnableChanged;
+        public event Action<bool, string>? ScanStateChanged;
 
         private SensorController()
         {
@@ -1376,7 +1407,8 @@ namespace SensorSdk
             {
                 structSize = (uint)Marshal.SizeOf<SenControllerCbs>(),
                 onScanResult = Marshal.GetFunctionPointerForDelegate(NativeCallbacks.ScanResult),
-                onEnableChanged = Marshal.GetFunctionPointerForDelegate(NativeCallbacks.EnableChanged)
+                onEnableChanged = Marshal.GetFunctionPointerForDelegate(NativeCallbacks.EnableChanged),
+                onScanStateChange = Marshal.GetFunctionPointerForDelegate(NativeCallbacks.ScanState)
             };
             Native.sen_controller_set_callbacks(_handle, in cbs, GCHandle.ToIntPtr(_ctxHandle));
         }
@@ -1744,6 +1776,23 @@ namespace SensorSdk
                 try
                 {
                     h(enabled);
+                }
+                catch (Exception ex)
+                {
+                    CallbackGuard.Log(ex);
+                }
+            }
+        }
+
+        internal void RaiseScanStateChanged(bool isScanning, string errorMsg)
+        {
+            var handler = ScanStateChanged;
+            if (handler == null) return;
+            foreach (Action<bool, string> h in handler.GetInvocationList())
+            {
+                try
+                {
+                    h(isScanning, errorMsg);
                 }
                 catch (Exception ex)
                 {

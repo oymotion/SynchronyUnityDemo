@@ -36,7 +36,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     private const int CmdTimeoutMs = 5000;
     private const int PlotUpdateIntervalMs = 50;
     private const int FftUpdateIntervalMs = 200;
-    private const string DemoVersion = "0.1.39";
+    private const string DemoVersion = "0.1.40";
     private const int PowerRefreshPeriodMs = 60000;
     private const int PowerStableBand = 4;
     private const uint ReplayDelegateTimeoutMs = 5000;
@@ -1972,7 +1972,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         else
             _wave2d.SetAutoYRange();
 
-        _spectrum.SetLabels(labels);
+        _spectrum.SetLabels(labels.Select(label => label.Split(" (")[0]).ToArray());
         _spectrum.SetPlaceholder(_wave2d.HasSource ? "Waiting for data ..." : "Not connected");
         _spectrum.ClearResult();
 
@@ -2190,7 +2190,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
         {
             _bioFftRows[row] = new BioFftBinding(buffer, channel);
             _bioSpectra[row].SetColorIndex(colorIndex);
-            _bioSpectra[row].SetLabels(new[] { label });
+            _bioSpectra[row].SetLabels(new[] { label.Split(" (")[0] });
             _bioSpectra[row].SetPlaceholder(string.Empty);
         }
         else
