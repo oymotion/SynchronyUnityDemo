@@ -142,6 +142,13 @@ namespace SensorSdk
                 throw new SensorException("Error: Timeout");
             return op.GetAwaiter().GetResult();
         }
+
+        internal static T AwaitThrow<T>(Task<T> op, int backstopMs)
+        {
+            if (Task.WhenAny(op, Task.Delay(backstopMs)).GetAwaiter().GetResult() != op)
+                throw new SensorException("Error: Timeout");
+            return op.GetAwaiter().GetResult();
+        }
     }
 
     public struct Sample
@@ -736,6 +743,21 @@ namespace SensorSdk
             return ParamResult.Check(await op.Task.ConfigureAwait(false));
         }
 
+        public async Task<byte[]> ExecAsync(byte[] data, int timeoutMs = 0)
+        {
+            var op = new CompletionOp<byte[]>();
+            Native.sen_profile_exec(Handle, timeoutMs, data, (UIntPtr)data.Length,
+                                    NativeCallbacks.Exec, op.CtxPtr);
+            return await op.Task.ConfigureAwait(false);
+        }
+
+        public byte[] Exec(byte[] data, int timeoutMs = 0)
+        {
+            CallbackGuard.ThrowOnSdkCallbackThread();
+            return SyncWait.AwaitThrow(ExecAsync(data, timeoutMs),
+                (timeoutMs > 0 ? timeoutMs : SensorController.AssumedCmdTimeoutMs) + 15000);
+        }
+
         public bool Connect()
         {
             CallbackGuard.ThrowOnSdkCallbackThread();
@@ -995,6 +1017,7 @@ namespace SensorSdk
         internal static readonly SenCompletionCb Completion = OnCompletion;
         internal static readonly SenCompletionCb BoolCompletion = OnBoolCompletion;
         internal static readonly SenParamCb Param = OnParam;
+        internal static readonly SenExecCb Exec = OnExec;
         internal static readonly SenBatteryCb Battery = OnBattery;
         internal static readonly SenInfoCb Info = OnInfo;
         internal static readonly SenMultiResultCb MultiResult = OnMultiResult;
@@ -1195,6 +1218,20 @@ namespace SensorSdk
             }
         }
 
+        [MonoPInvokeCallback(typeof(SenExecCb))]
+        private static void OnExec(IntPtr ctx, IntPtr result, UIntPtr resultSize, IntPtr errorMsg)
+        {
+            using var callbackScope = CallbackGuard.Enter();
+            try
+            {
+                CompletionOp<byte[]>.CompleteBytes(ctx, result, resultSize, errorMsg);
+            }
+            catch (Exception ex)
+            {
+                CallbackGuard.Log(ex);
+            }
+        }
+
         [MonoPInvokeCallback(typeof(SenBatteryCb))]
         private static void OnBattery(IntPtr ctx, int result, IntPtr errorMsg)
         {
@@ -1267,6 +1304,33 @@ namespace SensorSdk
                 string err = CapiString.FromPtr(errorMsg);
                 if (result != 0 && err.Length == 0) op._tcs.TrySetResult(map(err));
                 else op._tcs.TrySetException(new SensorException(err));
+            }
+            catch (Exception ex)
+            {
+                CallbackGuard.Log(ex);
+                if (op != null) op._tcs.TrySetException(ex);
+            }
+            finally
+            {
+                if (op != null && op._handle.IsAllocated) op._handle.Free();
+            }
+        }
+
+        internal static void CompleteBytes(IntPtr ctx, IntPtr result, UIntPtr resultSize, IntPtr errorMsg)
+        {
+            CompletionOp<byte[]>? op = null;
+            try
+            {
+                op = (CompletionOp<byte[]>)GCHandle.FromIntPtr(ctx).Target!;
+                string err = CapiString.FromPtr(errorMsg);
+                if (err.Length > 0)
+                {
+                    op._tcs.TrySetException(new SensorException(err));
+                    return;
+                }
+                var bytes = new byte[checked((int)resultSize)];
+                if (bytes.Length > 0) Marshal.Copy(result, bytes, 0, bytes.Length);
+                op._tcs.TrySetResult(bytes);
             }
             catch (Exception ex)
             {

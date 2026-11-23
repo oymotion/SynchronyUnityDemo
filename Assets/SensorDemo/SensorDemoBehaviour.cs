@@ -34,9 +34,10 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     private const int ScanDevicePeriodMs = 6000;
     private const int PackageCount = 32;
     private const int CmdTimeoutMs = 5000;
+    private const int NeucirCmdTimeoutMs = 50;
     private const int PlotUpdateIntervalMs = 50;
     private const int FftUpdateIntervalMs = 200;
-    private const string DemoVersion = "0.1.40";
+    private const string DemoVersion = "0.1.43";
     private const int PowerRefreshPeriodMs = 60000;
     private const int PowerStableBand = 4;
     private const uint ReplayDelegateTimeoutMs = 5000;
@@ -125,7 +126,7 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     private readonly Dictionary<string, string> _lastDataPaths = new Dictionary<string, string>();
     private bool _debugLogEnabled = true;
     private bool _binDataEnabled = true;
-    private bool _dongleDebugEnabled = true;
+    private bool _dongleDebugEnabled = false;
     private bool _translateImu = true;
     private bool _autoReconnect = true;
     private bool _dongleChecking;
@@ -527,7 +528,25 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
                                         && (st.Emg.Allocated || st.Angle.Allocated))
                                        || (st.GetBioKind() == DeviceState.BioKind.EEG && st.Eeg.Allocated)
                                        || (st.GetBioKind() == DeviceState.BioKind.PPG && st.Ppg.Allocated));
-        if (bioReady && _bioWaves.Count > 0 && !_bioWaves[0].HasSource)
+        bool bioBindingMissing = false;
+        if (st != null && st.GetBioKind() == DeviceState.BioKind.EMG)
+        {
+            bool hasAngle = st.Info.AngleChannelCount > 0 || st.Angle.Allocated;
+            int emgCh = st.Emg.Allocated ? Math.Min(st.Emg.Channels, _bioWaves.Count - (hasAngle ? 1 : 0)) : 0;
+            for (int i = 0; i < emgCh; i++)
+            {
+                if (!_bioWaves[i].HasSource)
+                {
+                    bioBindingMissing = true;
+                    break;
+                }
+            }
+            int angleIndex = emgCh;
+            if (hasAngle && st.Angle.Allocated && angleIndex < _bioWaves.Count
+                && !_bioWaves[angleIndex].HasSource)
+                bioBindingMissing = true;
+        }
+        if ((bioReady && _bioWaves.Count > 0 && !_bioWaves[0].HasSource) || bioBindingMissing)
             RetargetBio(st);
 
         RefreshValueLabels();
@@ -1131,17 +1150,43 @@ public sealed partial class SensorDemoBehaviour : MonoBehaviour
     // setParam / getParam controls
     // ------------------------------------------------------------------
 
-    private async Task<(string result, string error)> SendSetParam(SensorProfile profile, string key, string value)
+    private async Task<(string result, string error)> SendSetParam(SensorProfile profile, string key, string value,
+                                                                    int timeoutMs = 0)
     {
         try
         {
-            string result = await profile.SetParamAsync(key, value, CmdTimeoutMs);
+            string result = await profile.SetParamAsync(key, value, timeoutMs > 0 ? timeoutMs : CmdTimeoutMs);
             return (result, "");
         }
         catch (SensorException ex)
         {
             return ("", ex.Message);
         }
+    }
+
+    private static bool IsNeucirDevice(DeviceState st)
+    {
+        if (st == null || !st.HasInfo)
+            return false;
+        string model = (st.Info.ModelName ?? string.Empty).Trim();
+        return model.StartsWith("ORE-3000", StringComparison.OrdinalIgnoreCase)
+               || model.StartsWith("OYFM-70", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private async void OnNeucirControl(string key, string value)
+    {
+        DeviceState st = CurrentState();
+        if (st == null || st.IsReplay || !st.Profile.IsReady || !st.Profile.HasInited)
+            return;
+        (string msg, string error) = await SendSetParam(st.Profile, key, value, NeucirCmdTimeoutMs);
+        msg = error.Length > 0 ? error : msg;
+        AppLog($"User: setParam({key}, {value}) -> {msg}", "I", st);
+        if (error.Length == 0)
+        {
+            RecordSavedParam(st.Mac, key, value);
+            return;
+        }
+        ShowWarning("Set Parameter Failed", $"Failed to set {key}:\n{msg}");
     }
 
     private async void OnNtfToggled(string key, bool isOn)
