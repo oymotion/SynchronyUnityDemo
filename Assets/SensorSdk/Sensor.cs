@@ -603,7 +603,7 @@ namespace SensorSdk
         }
     }
 
-    public sealed class SensorProfile
+    public sealed partial class SensorProfile
     {
         internal IntPtr Handle { get; }
         private GCHandle _ctxHandle;
@@ -741,21 +741,6 @@ namespace SensorSdk
             var op = new CompletionOp<string>();
             Native.sen_profile_get_param(Handle, timeoutMs, key, NativeCallbacks.Param, op.CtxPtr);
             return ParamResult.Check(await op.Task.ConfigureAwait(false));
-        }
-
-        public async Task<byte[]> ExecAsync(byte[] data, int timeoutMs = 0)
-        {
-            var op = new CompletionOp<byte[]>();
-            Native.sen_profile_exec(Handle, timeoutMs, data, (UIntPtr)data.Length,
-                                    NativeCallbacks.Exec, op.CtxPtr);
-            return await op.Task.ConfigureAwait(false);
-        }
-
-        public byte[] Exec(byte[] data, int timeoutMs = 0)
-        {
-            CallbackGuard.ThrowOnSdkCallbackThread();
-            return SyncWait.AwaitThrow(ExecAsync(data, timeoutMs),
-                (timeoutMs > 0 ? timeoutMs : SensorController.AssumedCmdTimeoutMs) + 15000);
         }
 
         public bool Connect()
@@ -1001,7 +986,7 @@ namespace SensorSdk
         }
     }
 
-    internal static class NativeCallbacks
+    internal static partial class NativeCallbacks
     {
         internal static readonly SenDataCb Data = OnData;
         internal static readonly SenStateCb State = OnState;
@@ -1017,7 +1002,6 @@ namespace SensorSdk
         internal static readonly SenCompletionCb Completion = OnCompletion;
         internal static readonly SenCompletionCb BoolCompletion = OnBoolCompletion;
         internal static readonly SenParamCb Param = OnParam;
-        internal static readonly SenExecCb Exec = OnExec;
         internal static readonly SenBatteryCb Battery = OnBattery;
         internal static readonly SenInfoCb Info = OnInfo;
         internal static readonly SenMultiResultCb MultiResult = OnMultiResult;
@@ -1211,20 +1195,6 @@ namespace SensorSdk
             {
                 CompletionOp<string>.Complete(ctx, errorMsg,
                     _ => CapiString.FromPtr(result));
-            }
-            catch (Exception ex)
-            {
-                CallbackGuard.Log(ex);
-            }
-        }
-
-        [MonoPInvokeCallback(typeof(SenExecCb))]
-        private static void OnExec(IntPtr ctx, IntPtr result, UIntPtr resultSize, IntPtr errorMsg)
-        {
-            using var callbackScope = CallbackGuard.Enter();
-            try
-            {
-                CompletionOp<byte[]>.CompleteBytes(ctx, result, resultSize, errorMsg);
             }
             catch (Exception ex)
             {

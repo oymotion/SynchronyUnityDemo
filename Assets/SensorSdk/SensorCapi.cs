@@ -260,8 +260,6 @@ namespace SensorSdk.Capi
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate void SenParamCb(IntPtr ctx, IntPtr result, IntPtr errorMsg);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    internal delegate void SenExecCb(IntPtr ctx, IntPtr result, UIntPtr resultSize, IntPtr errorMsg);
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate void SenBatteryCb(IntPtr ctx, int result, IntPtr errorMsg);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate void SenInfoCb(IntPtr ctx, IntPtr info, IntPtr errorMsg);
@@ -270,7 +268,7 @@ namespace SensorSdk.Capi
     internal delegate void SenMultiResultCb(
         IntPtr ctx, IntPtr macs, IntPtr oks, IntPtr errors, UIntPtr count);
 
-    internal static class Native
+    internal static partial class Native
     {
 #if UNITY_IOS && !UNITY_EDITOR
         private const string Dll = "__Internal";
@@ -279,7 +277,7 @@ namespace SensorSdk.Capi
 #endif
         private const CallingConvention Cc = CallingConvention.Cdecl;
 
-        internal const uint ExpectedCapiVersion = 25;
+        internal const uint ExpectedCapiVersion = 26;
 
         [DllImport(Dll, CallingConvention = Cc)]
         internal static extern void sen_terminate();
@@ -469,11 +467,6 @@ namespace SensorSdk.Capi
             IntPtr profile, int timeoutMs,
             [MarshalAs(UnmanagedType.LPStr)] string key,
             SenParamCb cb, IntPtr ctx);
-
-        [DllImport(Dll, CallingConvention = Cc)]
-        internal static extern void sen_profile_exec(
-            IntPtr profile, int timeoutMs, byte[] data, UIntPtr dataSize,
-            SenExecCb cb, IntPtr ctx);
 
         [DllImport(Dll, CallingConvention = Cc)]
         internal static extern void sen_profile_set_auto_reconnect(IntPtr profile, int enabled);

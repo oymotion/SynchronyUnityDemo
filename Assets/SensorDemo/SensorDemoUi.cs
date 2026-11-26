@@ -155,21 +155,6 @@ public sealed partial class SensorDemoBehaviour
         GUILayout.Label(_powerText, Wrap());
         GUILayout.EndHorizontal();
 
-        DeviceState neucirState = CurrentState();
-        if (IsNeucirDevice(neucirState))
-        {
-            GUILayout.BeginVertical("box");
-            GUILayout.Label("<b>NeuCir Remote Control</b>", Rich());
-            GUILayout.BeginHorizontal();
-            bool neucirEnabled = !replaying && !neucirState.IsReplay
-                                 && neucirState.Profile.IsReady && neucirState.Profile.HasInited;
-            if (UiButton("APP_REMOTE", neucirEnabled)) OnNeucirControl("NEUCIR_SET_MODE", "APP_REMOTE");
-            if (UiButton("OPEN", neucirEnabled)) OnNeucirControl("NEUCIR_APP_CONTROL", "OPEN");
-            if (UiButton("CLOSE", neucirEnabled)) OnNeucirControl("NEUCIR_APP_CONTROL", "CLOSE");
-            if (UiButton("STOP", neucirEnabled)) OnNeucirControl("NEUCIR_APP_CONTROL", "STOP");
-            GUILayout.EndHorizontal();
-            GUILayout.EndVertical();
-        }
 
         // Packet loss + gesture boxes side by side.
         GUILayout.BeginHorizontal();
