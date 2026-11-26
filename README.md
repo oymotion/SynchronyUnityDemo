@@ -515,9 +515,8 @@ await sensorProfile.SetParamAsync("PPG_SAMPLE_RATE", "200");
 // getParam("<X>_SAMPLE_RATE_LIST")); an unsupported value returns
 // "Error: unsupported sample rate ...".
 
-// NeuCir remote control (NeuCir devices only)
-await sensorProfile.SetParamAsync("NEUCIR_SET_MODE", "APP_REMOTE");
-await sensorProfile.SetParamAsync("NEUCIR_APP_CONTROL", "OPEN");   // OPEN / CLOSE / STOP
+// Legacy raw-signal EMG only: "8" / "12" / "12:<batch_len>"
+await sensorProfile.SetParamAsync("EMG_RESOLUTION", "12");
 
 // Debug outputs
 await sensorProfile.SetParamAsync("DEBUG_BLE_DATA_PATH", "True");
@@ -554,14 +553,18 @@ result = await sensorProfile.GetParamAsync("EEG_SAMPLE_RATE_LIST");  // e.g. "25
 // "EMG_SAMPLE_RATE_LIST", "IMU_SAMPLE_RATE" / "IMU_SAMPLE_RATE_LIST",
 // "PPG_SAMPLE_RATE" / "PPG_SAMPLE_RATE_LIST"; an unsupported stream
 // answers "Error: Not supported".
+result = await sensorProfile.GetParamAsync("EMG_RESOLUTION");       // "8" or "12"
+result = await sensorProfile.GetParamAsync("EMG_RESOLUTION_LIST");  // "8|12" when supported
 ```
 
 ## Bin file recording and replay
 
-On every successful connect the SDK records all raw BLE packets of the
-session into a temp `.bin` file; `SetParamAsync("DEBUG_BLE_DATA_PATH", ...)`
-exports it on stream stop / disconnect. Bin files can be replayed offline
-for debugging and packet-loss analysis.
+Default session bin recording is off. Set the controller parameter
+`DEFAULT_BIN_RECORDER_ENABLED` to `"True"` to enable the default temporary
+capture, or set the profile parameter `DEBUG_BLE_DATA_PATH` to enable capture
+directly at the requested export path (this takes precedence over the default
+switch). Bin files can be replayed offline for debugging and packet-loss
+analysis.
 
 ### Get bin file info
 
@@ -688,7 +691,7 @@ log, the rest in the controller log.
 ## What this demo does
 
 - **Device page**: Start/Stop Scan, an RSSI insertion-sorted device list
-  (a device missing from three consecutive scan rounds is evicted;
+  (a device missing from four consecutive scan rounds is evicted;
   connected/replay rows are exempt) with
   in-place `[Connected]` / `[Streaming]` row marks. The selected row is the
   *current* device whose pages and setParam controls are bound to; Connect /
@@ -711,7 +714,9 @@ log, the rest in the controller log.
   deep-copy vs zero-copy batch queueing; default off = zero-copy).
 - **Settings**: Enable SDK Debug Log / Enable Debug Bin Data (the session's
   logs and .bin exports land in one timestamped subdir of
-  `Documents/sensorsdklog`), Data Notification switches (EEG/IMPE/EMG/GESTURE/
+  `Documents/sensorsdklog`), Enable debug dongle (off by default), Translate
+  IMU (on by default: split ACC/GYRO/Euler/Quat streams; off = aggregate
+  NTF_IMU), Data Notification switches (EEG/IMPE/EMG/GESTURE/
   PPG/SpO2/IMU/Angle, capability-gated by the device info), Filter switches
   (50Hz/60Hz/HPF/LPF, never hidden), Sample Rate radio groups
   (EEG 250/500/1000/2000 Hz, EMG 500/1000 Hz, IMU
@@ -722,17 +727,17 @@ log, the rest in the controller log.
 - **Bio page**: 8 waveform rows, auto-selected by device capability — EMG
   channels, or paged EEG channels plus ECG/BRTH slots (Prev/Next +
   "Page x / y"), or the PPG fixed plot set (EEG fp1/fp2 + PPG red/ir + SpO2
-  spo2/heart_rate). Each EMG/EEG channel row is a 50/50 split with the
-  channel's FFT spectrum on the left (same shared worker, following EEG
-  paging and the channel's curve color); ECG/BRTH/unused rows and the PPG
-  mode stay full-width. Impedance side texts on the EMG/EEG plots (green <=
-  500 / orange <= 999 / red above, KOhm). The **Live Filter** band selector
-  (Off / delta / theta / alpha / beta / gamma) band-passes the bio
+  spo2/heart_rate). An Angle stream adds a fixed 0-180 degree row after the
+  EMG channels or above ECG. EMG/EEG channel rows, the ECG row, and the PPG
+  mode's EEG/PPG rows are 50/50 splits with spectra computed at each stream's
+  own rate; BRTH/unused rows and SpO2 rows stay full-width. Impedance side
+  texts appear only when the device supports impedance and IMPE is on
+  (green <= 500 / orange <= 999 / red above, KOhm). The **Live Filter** band
+  selector (Off / delta / theta / alpha / beta / gamma) band-passes the bio
   waveforms of every device.
-- **IMU page**: ACC / GYRO / Quat / Euler 2D waveform (fixed Y ranges)
-  full-width with its FFT spectrum strip below it (recomputed every
-  200 ms on a worker thread), a Display Data Type selector, real-time value
-  labels, and a true-3D
+- **IMU page**: ACC / GYRO / MAG / Quat / Euler 2D waveform with automatic Y
+  ranges, an FFT spectrum strip (recomputed every 200 ms on a worker thread),
+  a Display Data Type selector, real-time value labels, and a true-3D
   quaternion cube (a GameObject rendered by a dedicated camera whose
   viewport sits on the page; it follows the latest quaternion sample).
 - **Replay Bin File** / **Analyze Bin**: replay a `.bin` capture through
